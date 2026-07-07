@@ -46,6 +46,7 @@ class ScrollAPI {
     _objectServerUrl = prefs.getString('object_server_url');
     _platformUrl = prefs.getString('platform_url');
     _token = prefs.getString('server_token');
+    _sessionUserId = prefs.getString('session_user_id');
   }
 
   Future<bool> connect({
@@ -275,15 +276,100 @@ No markdown, no backticks, no explanations. Only JSON.''';
     return null;
   }
 
+  /// Extract the user id from a loginWithPassword result.
+  String? sessionUserIdFromLogin(Map<String, dynamic> result) {
+    dynamic body = result['body'];
+    for (var depth = 0; depth < 2 && body is Map; depth++) {
+      final value = body['user_id'];
+      if (value is String && value.isNotEmpty) return value;
+      body = body['session'];
+    }
+    return null;
+  }
+
+  String? _sessionUserId;
+
+  /// The user id behind the current session token, when known (password
+  /// logins set it; deployment-token connections have none). Used to
+  /// prefill owner_id on record creates for owner-scoped app collections.
+  String? get sessionUserId => _sessionUserId;
+
+  Future<void> setSessionUser(String? userId) async {
+    _sessionUserId = (userId == null || userId.isEmpty) ? null : userId;
+    final prefs = await SharedPreferences.getInstance();
+    if (_sessionUserId == null) {
+      await prefs.remove('session_user_id');
+    } else {
+      await prefs.setString('session_user_id', _sessionUserId!);
+    }
+  }
+
+  // --- AI provider service keys (write-only) + AI chat ---
+
+  /// Store an AI provider key for a user (self-service with the user's own
+  /// session). The server never returns key material — GET lists which
+  /// services have keys, nothing more.
+  Future<Map<String, dynamic>> setServiceKey(
+    String userId, {
+    required String service,
+    required String key,
+  }) {
+    return rawRequest(
+      'PUT',
+      _objUrl('identity/users/${_pathSegment(userId)}/service-keys'),
+      data: {'service': service, 'key': key},
+    );
+  }
+
+  Future<Map<String, dynamic>> listServiceKeys(String userId) {
+    return rawRequest(
+      'GET',
+      _objUrl('identity/users/${_pathSegment(userId)}/service-keys'),
+    );
+  }
+
+  Future<Map<String, dynamic>> removeServiceKey(String userId, String service) {
+    return rawRequest(
+      'DELETE',
+      _objUrl(
+        'identity/users/${_pathSegment(userId)}/service-keys/'
+        '${_pathSegment(service)}',
+      ),
+    );
+  }
+
+  /// One AI conversation turn using the caller's stored provider key.
+  /// Tool calls dispatch with the caller's credentials — the AI can do
+  /// exactly what the session could, permission-checked and audited.
+  Future<Map<String, dynamic>> aiChat({
+    required String message,
+    String? model,
+    List<String>? tools,
+    int? maxRounds,
+  }) {
+    return rawRequest(
+      'POST',
+      _objUrl('api/ai/chat'),
+      data: {
+        'message': message,
+        if (model != null && model.isNotEmpty) 'model': model,
+        if (tools != null) 'tools': tools,
+        if (maxRounds != null) 'max_rounds': maxRounds,
+      },
+    );
+  }
+
   Future<void> disconnect() async {
     _objectServerUrl = null;
     _platformUrl = null;
     _token = null;
+    _sessionUserId = null;
     authRejected.value = false;
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('object_server_url');
     await prefs.remove('platform_url');
     await prefs.remove('server_token');
+    await prefs.remove('session_user_id');
   }
 
   // --- HTTP helpers ---
@@ -864,6 +950,24 @@ No markdown, no backticks, no explanations. Only JSON.''';
       'results',
       'rows',
     ]);
+  }
+
+  /// Global search across searchable collections (schemas with a `search`
+  /// key opt in). Permission-aware server-side: denied collections are
+  /// skipped, row filters and field redaction apply before matching.
+  /// Returns {status, query, limit, results: {collection: [records]},
+  /// total_count, warnings?} or null on failure.
+  Future<Map<String, dynamic>?> globalSearch(
+    String query, {
+    int limit = 10,
+    List<String>? collections,
+  }) async {
+    var url = 'api/search?q=${Uri.encodeQueryComponent(query)}&limit=$limit';
+    if (collections != null && collections.isNotEmpty) {
+      url += '&collections=${Uri.encodeQueryComponent(collections.join(","))}';
+    }
+    final result = await _getRaw(_objUrl(url));
+    return result is Map<String, dynamic> ? result : null;
   }
 
   Future<Map<String, dynamic>?> getAdminCollectionRecord(

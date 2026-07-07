@@ -6,6 +6,14 @@ import 'api.dart';
 /// object server). Schemas declare semantics, never widgets — this file maps
 /// those semantics onto Scroll's idiom (dropdowns, pickers, switches).
 
+/// Boolean record fields store canonically as "true"/"false" strings; older
+/// rows and raw-JSON writes may hold real booleans or other spellings.
+bool schemaBoolIsTrue(dynamic value) {
+  if (value is bool) return value;
+  final text = value?.toString().trim().toLowerCase();
+  return text == 'true' || text == '1' || text == 'yes';
+}
+
 class SchemaFieldSpec {
   SchemaFieldSpec({
     required this.name,
@@ -20,6 +28,7 @@ class SchemaFieldSpec {
     required this.placeholder,
     required this.help,
     required this.validation,
+    required this.transitions,
   });
 
   final String name;
@@ -35,7 +44,24 @@ class SchemaFieldSpec {
   final String? help;
   final Map<String, dynamic> validation;
 
+  /// Enum lifecycle map ({state: [allowed next states]}), enforced on record
+  /// update server-side. A value missing from the map is terminal.
+  final Map<String, List<String>> transitions;
+
   bool get isEnum => enumValues.isNotEmpty;
+  bool get hasTransitions => transitions.isNotEmpty;
+
+  /// The enum values legal from [current]: the current state plus its
+  /// allowed moves. Without a transitions map (or before a value exists,
+  /// i.e. on create) every enum value is offered.
+  List<String> allowedEnumValues(String? current) {
+    if (!hasTransitions || current == null || current.isEmpty) {
+      return enumValues;
+    }
+    final moves = transitions[current] ?? const <String>[];
+    return [current, ...moves.where((move) => move != current)];
+  }
+
   bool get isRelation =>
       relationCollection != null && relationCollection!.isNotEmpty;
   bool get isBoolean => type == 'boolean' || type == 'bool';
@@ -85,6 +111,16 @@ class SchemaFieldSpec {
       help: (raw['help'] ?? raw['description'])?.toString(),
       validation: raw['validation'] is Map
           ? Map<String, dynamic>.from(raw['validation'] as Map)
+          : const {},
+      transitions: raw['transitions'] is Map
+          ? (raw['transitions'] as Map).map(
+              (state, moves) => MapEntry(
+                state.toString(),
+                moves is List
+                    ? moves.map((move) => move.toString()).toList()
+                    : const <String>[],
+              ),
+            )
           : const {},
     );
   }
@@ -238,9 +274,14 @@ class _SchemaRecordFormDialogState extends State<_SchemaRecordFormDialog> {
     super.initState();
     for (final field in widget.spec.fields) {
       if (field.readOnly) continue;
-      final initial = widget.initial?[field.name] ?? field.defaultValue;
+      var initial = widget.initial?[field.name] ?? field.defaultValue;
+      // Owner-scoped app collections require owner_id == session user on
+      // create; prefill it so the server-enforced value is the starting one.
+      if (!_isEdit && initial == null && field.name == 'owner_id') {
+        initial = ScrollAPI().sessionUserId;
+      }
       if (field.isBoolean) {
-        _booleans[field.name] = initial == true;
+        _booleans[field.name] = schemaBoolIsTrue(initial);
       } else if (field.isEnum) {
         final value = initial?.toString();
         _enums[field.name] = field.enumValues.contains(value) ? value : null;
@@ -306,7 +347,8 @@ class _SchemaRecordFormDialogState extends State<_SchemaRecordFormDialog> {
       if (field.readOnly) continue;
       dynamic value;
       if (field.isBoolean) {
-        value = _booleans[field.name] ?? false;
+        // Booleans store canonically as "true"/"false" strings server-side.
+        value = (_booleans[field.name] ?? false) ? 'true' : 'false';
       } else if (field.isEnum) {
         value = _enums[field.name];
       } else if (field.isRelation) {
@@ -406,6 +448,20 @@ class _SchemaRecordFormDialogState extends State<_SchemaRecordFormDialog> {
     }
 
     if (field.isEnum) {
+      // With a transitions map, edits may only move from the record's
+      // stored state to its allowed next states (server-enforced).
+      final storedState = _isEdit
+          ? widget.initial![field.name]?.toString()
+          : null;
+      final values = field.allowedEnumValues(storedState);
+      final terminal =
+          field.hasTransitions && storedState != null && values.length == 1;
+      var helper = field.help;
+      if (terminal) {
+        helper = '"$storedState" is a terminal state';
+      } else if (field.hasTransitions && storedState != null) {
+        helper = helper ?? 'Allowed moves from "$storedState"';
+      }
       return Padding(
         padding: const EdgeInsets.only(bottom: 12),
         child: DropdownButtonFormField<String>(
@@ -413,7 +469,7 @@ class _SchemaRecordFormDialogState extends State<_SchemaRecordFormDialog> {
           decoration: InputDecoration(
             border: const OutlineInputBorder(),
             labelText: label,
-            helperText: field.help,
+            helperText: helper,
             errorText: error,
             isDense: true,
           ),
@@ -423,12 +479,14 @@ class _SchemaRecordFormDialogState extends State<_SchemaRecordFormDialog> {
                 value: null,
                 child: Text('—', style: TextStyle(color: Colors.white38)),
               ),
-            ...field.enumValues.map(
+            ...values.map(
               (value) =>
                   DropdownMenuItem<String>(value: value, child: Text(value)),
             ),
           ],
-          onChanged: (value) => setState(() => _enums[field.name] = value),
+          onChanged: terminal
+              ? null
+              : (value) => setState(() => _enums[field.name] = value),
         ),
       );
     }

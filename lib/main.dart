@@ -516,7 +516,11 @@ class _ConnectScreenState extends State<ConnectScreen> {
         return;
       }
       token = sessionToken;
+      await api.setSessionUser(api.sessionUserIdFromLogin(login));
       setState(() => _status = 'Signed in — connecting session...');
+    } else {
+      // Deployment-token connection: no user identity behind the token.
+      await ScrollAPI().setSessionUser(null);
     }
     final success = await ScrollAPI().connect(
       objectServerUrl: _objUrlController.text.trim(),
@@ -743,6 +747,8 @@ class _MainShellState extends State<MainShell> {
 
   final _adminNavItems = [
     _NavItem('Home', Icons.home_outlined),
+    _NavItem('Search', Icons.search_outlined),
+    _NavItem('Chat', Icons.forum_outlined),
     _NavItem('Collections', Icons.storage_outlined),
     _NavItem('Objects', Icons.code_outlined),
     _NavItem('Stations', Icons.dns_outlined),
@@ -856,20 +862,22 @@ class _MainShellState extends State<MainShell> {
   Widget _getAdminView() {
     return switch (_adminNav) {
       0 => SwitchboardView(onNavigate: _navigate),
-      1 => const CollectionBrowser(),
-      2 => ObjectWorkspace(onNavigate: _navigate),
-      3 => StationMonitor(onNavigate: _navigate),
-      4 => const IdentityRegistryView(),
-      5 => const PermissionsView(),
-      6 => const APIExplorerView(),
-      7 => const SQLQueryView(),
-      8 => const DaemonStatusView(),
-      9 => const ChangesView(),
-      10 => const FileManagerView(),
-      11 => const SchemaEditorView(),
-      12 => const DiagramView(),
-      13 => const PackageManagerView(),
-      14 => const BackupView(),
+      1 => const GlobalSearchView(),
+      2 => const AIChatView(),
+      3 => const CollectionBrowser(),
+      4 => ObjectWorkspace(onNavigate: _navigate),
+      5 => StationMonitor(onNavigate: _navigate),
+      6 => const IdentityRegistryView(),
+      7 => const PermissionsView(),
+      8 => const APIExplorerView(),
+      9 => const SQLQueryView(),
+      10 => const DaemonStatusView(),
+      11 => const ChangesView(),
+      12 => const FileManagerView(),
+      13 => const SchemaEditorView(),
+      14 => const DiagramView(),
+      15 => const PackageManagerView(),
+      16 => const BackupView(),
       _ => SwitchboardView(onNavigate: _navigate),
     };
   }
@@ -13323,6 +13331,805 @@ class _IdentityRegistryViewState extends State<IdentityRegistryView> {
 // Changes (admin read-only timeline)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// AI CHAT — POST /api/ai/chat. One conversation turn per request, using the
+// caller's server-stored provider key (Settings → Server AI Keys). Tool
+// calls dispatch with the caller's own credentials: the AI can do exactly
+// what this session could, permission-checked and audited.
+// ---------------------------------------------------------------------------
+
+class AIChatView extends StatefulWidget {
+  const AIChatView({super.key});
+
+  @override
+  State<AIChatView> createState() => _AIChatViewState();
+}
+
+class _ChatTurn {
+  _ChatTurn({required this.question});
+
+  final String question;
+  String? reply;
+  List<dynamic> toolCalls = const [];
+  Map<String, dynamic>? usage;
+  String? error;
+  bool pending = true;
+}
+
+class _AIChatViewState extends State<AIChatView> {
+  final _messageController = TextEditingController();
+  final _toolsController = TextEditingController(
+    text: 'global_search, list_collections',
+  );
+  final _chatScroll = ScrollController();
+  final List<_ChatTurn> _turns = [];
+  String _model = 'anthropic:claude-haiku-4-5';
+  bool _sending = false;
+
+  static const _models = [
+    'anthropic:claude-haiku-4-5',
+    'anthropic:claude-sonnet-5',
+    'anthropic:claude-opus-4-8',
+    'openai:gpt-4o-mini',
+    'openai:gpt-4o',
+  ];
+
+  @override
+  void dispose() {
+    _messageController.dispose();
+    _toolsController.dispose();
+    _chatScroll.dispose();
+    super.dispose();
+  }
+
+  List<String> get _tools => [
+    for (final tool in _toolsController.text.split(','))
+      if (tool.trim().isNotEmpty) tool.trim(),
+  ];
+
+  Future<void> _send() async {
+    final message = _messageController.text.trim();
+    if (message.isEmpty || _sending) return;
+    final turn = _ChatTurn(question: message);
+    setState(() {
+      _turns.add(turn);
+      _sending = true;
+      _messageController.clear();
+    });
+    _scrollToEnd();
+    final result = await ScrollAPI().aiChat(
+      message: message,
+      model: _model,
+      tools: _tools,
+    );
+    if (!mounted) return;
+    final status = result['status'];
+    final body = result['body'];
+    setState(() {
+      turn.pending = false;
+      _sending = false;
+      if (status is int && status >= 200 && status < 300 && body is Map) {
+        turn.reply = (body['reply'] ?? body['message'] ?? body['content'])
+            ?.toString();
+        turn.toolCalls = body['tool_calls'] is List
+            ? body['tool_calls'] as List
+            : const [];
+        turn.usage = body['usage'] is Map
+            ? Map<String, dynamic>.from(body['usage'] as Map)
+            : null;
+        if (turn.reply == null) {
+          turn.error = 'No reply in response: ${jsonEncode(body)}';
+        }
+      } else {
+        final detail = body is Map && body['error'] != null
+            ? body['error'].toString()
+            : (result['error']?.toString() ?? jsonEncode(body));
+        turn.error = 'HTTP ${status ?? '?'} — $detail';
+      }
+    });
+    _scrollToEnd();
+  }
+
+  void _scrollToEnd() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_chatScroll.hasClients) {
+        _chatScroll.animateTo(
+          _chatScroll.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final needsUser = ScrollAPI().sessionUserId == null;
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('AI Chat', style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(width: 8),
+              _chatChip('POST /api/ai/chat', Colors.blue),
+              const SizedBox(width: 8),
+              _chatChip('CALLER-SCOPED TOOLS', Colors.green),
+              const Spacer(),
+              DropdownButton<String>(
+                value: _model,
+                style: const TextStyle(fontSize: 12, color: Colors.white70),
+                dropdownColor: Theme.of(context).colorScheme.surfaceContainer,
+                items: _models
+                    .map(
+                      (model) =>
+                          DropdownMenuItem(value: model, child: Text(model)),
+                    )
+                    .toList(),
+                onChanged: (value) {
+                  if (value != null) setState(() => _model = value);
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _toolsController,
+            decoration: const InputDecoration(
+              labelText: 'Tools (comma-separated MCP tool names)',
+              helperText:
+                  'Any subset of the server\'s MCP catalog — a small list '
+                  'keeps fast models fast. Empty = no tools.',
+              border: OutlineInputBorder(),
+              isDense: true,
+            ),
+            style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+          ),
+          if (needsUser)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                'Chat uses a provider key stored for YOUR user on the '
+                'server (Settings → Server AI Keys). Sign in with email + '
+                'password first — a deployment token has no user to hold '
+                'a key.',
+                style: TextStyle(fontSize: 12, color: Colors.amber[300]),
+              ),
+            ),
+          const SizedBox(height: 12),
+          Expanded(
+            child: _turns.isEmpty
+                ? const Center(
+                    child: Text(
+                      'Ask the server\'s AI anything — it can call the MCP '
+                      'tools above with your session\'s permissions.\n'
+                      'Each message is one independent turn (no memory yet).',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.white38, fontSize: 13),
+                    ),
+                  )
+                : ListView(
+                    controller: _chatScroll,
+                    children: [for (final turn in _turns) _turnWidget(turn)],
+                  ),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _messageController,
+                  onSubmitted: (_) => _send(),
+                  decoration: InputDecoration(
+                    hintText: 'Message the server\'s AI...',
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    isDense: true,
+                  ),
+                  style: const TextStyle(fontSize: 13),
+                ),
+              ),
+              const SizedBox(width: 10),
+              FilledButton.icon(
+                onPressed: _sending ? null : _send,
+                icon: _sending
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.send, size: 16),
+                label: const Text('Send'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _turnWidget(_ChatTurn turn) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Align(
+          alignment: Alignment.centerRight,
+          child: Container(
+            margin: const EdgeInsets.only(top: 10, bottom: 6, left: 80),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.blue.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: SelectableText(
+              turn.question,
+              style: const TextStyle(fontSize: 13),
+            ),
+          ),
+        ),
+        if (turn.pending)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 8),
+            child: SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+          ),
+        if (turn.error != null)
+          Container(
+            margin: const EdgeInsets.only(bottom: 6, right: 80),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.red.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: SelectableText(
+              turn.error!,
+              style: TextStyle(fontSize: 12, color: Colors.red[200]),
+            ),
+          ),
+        if (turn.toolCalls.isNotEmpty)
+          Container(
+            margin: const EdgeInsets.only(bottom: 6, right: 80),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.03),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.white10),
+            ),
+            child: Theme(
+              data: Theme.of(
+                context,
+              ).copyWith(dividerColor: Colors.transparent),
+              child: ExpansionTile(
+                dense: true,
+                tilePadding: const EdgeInsets.symmetric(horizontal: 12),
+                title: Text(
+                  '${turn.toolCalls.length} tool call'
+                  '${turn.toolCalls.length == 1 ? '' : 's'}',
+                  style: const TextStyle(fontSize: 12, color: Colors.white54),
+                ),
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                    child: SelectableText(
+                      const JsonEncoder.withIndent(
+                        '  ',
+                      ).convert(turn.toolCalls),
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 11,
+                        color: Colors.white70,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        if (turn.reply != null)
+          Container(
+            margin: const EdgeInsets.only(bottom: 4, right: 80),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.05),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: SelectableText(
+              turn.reply!,
+              style: const TextStyle(fontSize: 13, height: 1.4),
+            ),
+          ),
+        if (turn.usage != null)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Text(
+              turn.usage!.entries
+                  .map((entry) => '${entry.key}: ${entry.value}')
+                  .join('  ·  '),
+              style: const TextStyle(fontSize: 10, color: Colors.white30),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _chatChip(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+          color: color,
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GLOBAL SEARCH — GET /api/search across searchable collections. Results
+// arrive per-collection; each group renders under its schema's
+// views.list_mode (table | cards | feed) and views.list_fields.
+// ---------------------------------------------------------------------------
+
+class GlobalSearchView extends StatefulWidget {
+  const GlobalSearchView({super.key});
+
+  @override
+  State<GlobalSearchView> createState() => _GlobalSearchViewState();
+}
+
+class _GlobalSearchViewState extends State<GlobalSearchView> {
+  final _queryController = TextEditingController();
+  final _queryFocus = FocusNode();
+  Map<String, dynamic>? _response;
+  final Map<String, SchemaFormSpec> _specs = {};
+  bool _loading = false;
+  String? _error;
+  String? _searchedQuery;
+
+  @override
+  void dispose() {
+    _queryController.dispose();
+    _queryFocus.dispose();
+    super.dispose();
+  }
+
+  Future<void> _search() async {
+    final query = _queryController.text.trim();
+    if (query.isEmpty) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+      _searchedQuery = query;
+    });
+    final response = await ScrollAPI().globalSearch(query, limit: 25);
+    if (!mounted) return;
+    if (response == null) {
+      setState(() {
+        _loading = false;
+        _error = ScrollAPI().lastError ?? 'Search request failed';
+      });
+      return;
+    }
+    setState(() {
+      _response = response;
+      _loading = false;
+    });
+    // Fetch schemas for result collections we haven't seen yet, so groups
+    // can render list_fields / list_mode. Results show immediately; rows
+    // refine as specs arrive.
+    final results = _results(response);
+    for (final collection in results.keys) {
+      if (_specs.containsKey(collection)) continue;
+      ScrollAPI().getAdminSchema(collection).then((detail) {
+        if (!mounted || detail == null) return;
+        setState(() {
+          _specs[collection] = SchemaFormSpec.fromSchema(detail);
+        });
+      });
+    }
+  }
+
+  Map<String, List<Map<String, dynamic>>> _results(
+    Map<String, dynamic> response,
+  ) {
+    final raw = response['results'];
+    final results = <String, List<Map<String, dynamic>>>{};
+    if (raw is Map) {
+      raw.forEach((collection, records) {
+        if (records is! List) return;
+        results[collection.toString()] = [
+          for (final record in records)
+            if (record is Map)
+              Map<String, dynamic>.from(
+                record.map((k, v) => MapEntry(k.toString(), v)),
+              ),
+        ];
+      });
+    }
+    return results;
+  }
+
+  List<String> _rowFields(String collection, Map<String, dynamic> record) {
+    final listFields = _specs[collection]?.listFields ?? const [];
+    if (listFields.isNotEmpty) return listFields;
+    return [
+      for (final key in record.keys)
+        if (key != 'id') key,
+    ].take(4).toList();
+  }
+
+  String _recordTitle(String collection, Map<String, dynamic> record) {
+    for (final field in _rowFields(collection, record)) {
+      final value = record[field];
+      if (value != null && value.toString().trim().isNotEmpty) {
+        return value.toString();
+      }
+    }
+    return record['id']?.toString() ?? '(record)';
+  }
+
+  void _showRecord(String collection, Map<String, dynamic> record) {
+    final recordId = record['id']?.toString() ?? '';
+    final hasPublicFlag = record.containsKey('is_public');
+    final isPublic = schemaBoolIsTrue(record['is_public']);
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('$collection / $recordId'),
+        content: SizedBox(
+          width: 560,
+          child: SingleChildScrollView(
+            child: SelectableText(
+              const JsonEncoder.withIndent('  ').convert(record),
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+            ),
+          ),
+        ),
+        actions: [
+          if (hasPublicFlag && recordId.isNotEmpty)
+            TextButton.icon(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _togglePublic(collection, recordId, makePublic: !isPublic);
+              },
+              icon: Icon(
+                isPublic ? Icons.lock_outline : Icons.public,
+                size: 16,
+              ),
+              label: Text(isPublic ? 'Make Private' : 'Make Public'),
+            ),
+          if (recordId.isNotEmpty)
+            TextButton.icon(
+              // Permalink convention: /{collection}/{id} via site_routes.
+              onPressed: () {
+                final base = ScrollAPI().objectServerUrl;
+                if (base != null) {
+                  Process.run('open', ['$base$collection/$recordId']);
+                }
+              },
+              icon: const Icon(Icons.open_in_browser, size: 16),
+              label: const Text('Open Page'),
+            ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _togglePublic(
+    String collection,
+    String recordId, {
+    required bool makePublic,
+  }) async {
+    final result = await ScrollAPI().updateAdminCollectionRecord(
+      collection,
+      recordId,
+      {'is_public': makePublic ? 'true' : 'false'},
+    );
+    if (!mounted) return;
+    final status = result['status'];
+    final ok = status is int && status >= 200 && status < 300;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          ok
+              ? '$collection/$recordId is now '
+                    '${makePublic ? 'public' : 'private'}'
+              : 'Update failed: HTTP ${status ?? result['error'] ?? '?'}',
+        ),
+        backgroundColor: ok ? Colors.green[800] : Colors.red[800],
+      ),
+    );
+    if (ok) _search();
+  }
+
+  Widget? _publicBadge(Map<String, dynamic> record) {
+    if (!record.containsKey('is_public')) return null;
+    final isPublic = schemaBoolIsTrue(record['is_public']);
+    return _searchChip(
+      isPublic ? 'PUBLIC' : 'PRIVATE',
+      isPublic ? Colors.green : Colors.blueGrey,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final response = _response;
+    final results = response == null ? null : _results(response);
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('Search', style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(width: 8),
+              _searchChip('GET /api/search', Colors.blue),
+              const SizedBox(width: 8),
+              _searchChip('PERMISSION-AWARE', Colors.green),
+              const Spacer(),
+              if (_loading)
+                const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _queryController,
+                  focusNode: _queryFocus,
+                  autofocus: true,
+                  onSubmitted: (_) => _search(),
+                  decoration: InputDecoration(
+                    hintText: 'Search all collections your session can read...',
+                    prefixIcon: const Icon(Icons.search, size: 18),
+                    isDense: true,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  style: const TextStyle(fontSize: 13),
+                ),
+              ),
+              const SizedBox(width: 10),
+              FilledButton.icon(
+                onPressed: _loading ? null : _search,
+                icon: const Icon(Icons.search, size: 16),
+                label: const Text('Search'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Text(
+                _error!,
+                style: TextStyle(color: Colors.red[300], fontSize: 12),
+              ),
+            ),
+          Expanded(child: _body(context, results)),
+        ],
+      ),
+    );
+  }
+
+  Widget _body(
+    BuildContext context,
+    Map<String, List<Map<String, dynamic>>>? results,
+  ) {
+    if (results == null) {
+      return const Center(
+        child: Text(
+          'Terms are AND-ed across each collection\'s searchable fields.\n'
+          'Collections opt in via their schema — denied collections are '
+          'skipped server-side.',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Colors.white38, fontSize: 13),
+        ),
+      );
+    }
+    final total = _response?['total_count'];
+    final warnings = _response?['warnings'];
+    final nonEmpty = results.entries.where((e) => e.value.isNotEmpty).toList();
+    if (nonEmpty.isEmpty) {
+      return Center(
+        child: Text(
+          'No matches for "${_searchedQuery ?? ''}"',
+          style: const TextStyle(color: Colors.white38, fontSize: 13),
+        ),
+      );
+    }
+    return ListView(
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Text(
+            '${total ?? nonEmpty.fold<int>(0, (n, e) => n + e.value.length)} '
+            'result(s) for "${_searchedQuery ?? ''}"',
+            style: const TextStyle(color: Colors.white38, fontSize: 12),
+          ),
+        ),
+        if (warnings is List && warnings.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Text(
+              warnings.join(' · '),
+              style: TextStyle(color: Colors.amber[300], fontSize: 12),
+            ),
+          ),
+        for (final entry in nonEmpty) ...[
+          Padding(
+            padding: const EdgeInsets.only(top: 12, bottom: 6),
+            child: Row(
+              children: [
+                Icon(
+                  switch (_specs[entry.key]?.listMode) {
+                    'cards' => Icons.grid_view_outlined,
+                    'feed' => Icons.view_agenda_outlined,
+                    _ => Icons.table_rows_outlined,
+                  },
+                  size: 15,
+                  color: Colors.white54,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  entry.key,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  '${entry.value.length}',
+                  style: const TextStyle(fontSize: 12, color: Colors.white38),
+                ),
+              ],
+            ),
+          ),
+          if (_specs[entry.key]?.listMode == 'cards')
+            Wrap(
+              spacing: 10,
+              runSpacing: 10,
+              children: [
+                for (final record in entry.value)
+                  _recordCard(entry.key, record),
+              ],
+            )
+          else
+            for (final record in entry.value) _recordRow(entry.key, record),
+        ],
+      ],
+    );
+  }
+
+  Widget _recordCard(String collection, Map<String, dynamic> record) {
+    final fields = _rowFields(collection, record);
+    return InkWell(
+      onTap: () => _showRecord(collection, record),
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        width: 260,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.04),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.white10),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              _recordTitle(collection, record),
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 6),
+            for (final field in fields.skip(1))
+              if (record[field] != null && field != 'is_public')
+                Text(
+                  '$field: ${record[field]}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 11, color: Colors.white54),
+                ),
+            if (_publicBadge(record) case final badge?)
+              Padding(padding: const EdgeInsets.only(top: 6), child: badge),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _recordRow(String collection, Map<String, dynamic> record) {
+    final fields = _rowFields(collection, record);
+    final detail = [
+      for (final field in fields.skip(1))
+        if (record[field] != null && field != 'is_public')
+          '$field: ${record[field]}',
+    ].join('  ·  ');
+    return InkWell(
+      onTap: () => _showRecord(collection, record),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 10),
+        decoration: const BoxDecoration(
+          border: Border(bottom: BorderSide(color: Colors.white10)),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              flex: 2,
+              child: Text(
+                _recordTitle(collection, record),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 13),
+              ),
+            ),
+            if (detail.isNotEmpty)
+              Expanded(
+                flex: 3,
+                child: Text(
+                  detail,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 12, color: Colors.white54),
+                ),
+              ),
+            if (_publicBadge(record) case final badge?)
+              Padding(padding: const EdgeInsets.only(right: 8), child: badge),
+            Text(
+              record['id']?.toString() ?? '',
+              style: const TextStyle(fontSize: 11, color: Colors.white30),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _searchChip(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+          color: color,
+        ),
+      ),
+    );
+  }
+}
+
 class ChangesView extends StatefulWidget {
   const ChangesView({super.key});
 
@@ -15155,11 +15962,17 @@ class _SettingsViewState extends State<SettingsView> {
   final _openaiController = TextEditingController();
   bool _openaiSaved = false;
   bool _showKey = false;
+  final _serviceKeyController = TextEditingController();
+  String _service = 'anthropic';
+  List<String> _serverKeyServices = [];
+  String? _serverKeyStatus;
+  bool _serverKeyBusy = false;
 
   @override
   void initState() {
     super.initState();
     _load();
+    _loadServerKeys();
   }
 
   Future<void> _load() async {
@@ -15167,6 +15980,65 @@ class _SettingsViewState extends State<SettingsView> {
     if (mounted && key != null) {
       setState(() => _openaiController.text = key);
     }
+  }
+
+  Future<void> _loadServerKeys() async {
+    final userId = ScrollAPI().sessionUserId;
+    if (userId == null) return;
+    final result = await ScrollAPI().listServiceKeys(userId);
+    if (!mounted) return;
+    final body = result['body'];
+    final raw = body is Map ? (body['services'] ?? body['keys']) : null;
+    setState(() {
+      _serverKeyServices = [
+        if (raw is List)
+          for (final item in raw)
+            if (item is Map)
+              (item['service'] ?? '').toString()
+            else
+              item.toString(),
+      ]..removeWhere((service) => service.isEmpty);
+    });
+  }
+
+  Future<void> _saveServerKey() async {
+    final userId = ScrollAPI().sessionUserId;
+    final key = _serviceKeyController.text.trim();
+    if (userId == null || key.isEmpty) return;
+    setState(() => _serverKeyBusy = true);
+    final result = await ScrollAPI().setServiceKey(
+      userId,
+      service: _service,
+      key: key,
+    );
+    if (!mounted) return;
+    final status = result['status'];
+    final ok = status is int && status >= 200 && status < 300;
+    setState(() {
+      _serverKeyBusy = false;
+      _serverKeyStatus = ok
+          ? '$_service key stored on the server'
+          : 'Failed: HTTP ${status ?? result['error'] ?? '?'}';
+      if (ok) _serviceKeyController.clear();
+    });
+    if (ok) _loadServerKeys();
+  }
+
+  Future<void> _removeServerKey(String service) async {
+    final userId = ScrollAPI().sessionUserId;
+    if (userId == null) return;
+    setState(() => _serverKeyBusy = true);
+    final result = await ScrollAPI().removeServiceKey(userId, service);
+    if (!mounted) return;
+    final status = result['status'];
+    final ok = status is int && status >= 200 && status < 300;
+    setState(() {
+      _serverKeyBusy = false;
+      _serverKeyStatus = ok
+          ? '$service key removed'
+          : 'Failed: HTTP ${status ?? result['error'] ?? '?'}';
+    });
+    if (ok) _loadServerKeys();
   }
 
   Future<void> _saveOpenAI() async {
@@ -15307,6 +16179,117 @@ class _SettingsViewState extends State<SettingsView> {
                   ],
                 ],
               ),
+
+              const SizedBox(height: 32),
+
+              // Server-side AI provider keys (write-only)
+              Text(
+                'SERVER AI KEYS',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white38,
+                  letterSpacing: 1,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Keys stored on the object server power its AI Chat '
+                '(POST /api/ai/chat). Write-only: the server never returns '
+                'key material, only which services have one.',
+                style: TextStyle(fontSize: 12, color: Colors.white54),
+              ),
+              const SizedBox(height: 12),
+              if (api.sessionUserId == null)
+                Text(
+                  'Sign in with email + password to manage server keys — '
+                  'a deployment token has no user identity to attach '
+                  'keys to.',
+                  style: TextStyle(fontSize: 12, color: Colors.amber[300]),
+                )
+              else ...[
+                if (_serverKeyServices.isNotEmpty) ...[
+                  for (final service in _serverKeyServices)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 4),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.key, size: 14, color: Colors.green),
+                          const SizedBox(width: 8),
+                          Text(
+                            '$service — key stored',
+                            style: const TextStyle(fontSize: 13),
+                          ),
+                          const SizedBox(width: 12),
+                          TextButton(
+                            onPressed: _serverKeyBusy
+                                ? null
+                                : () => _removeServerKey(service),
+                            child: Text(
+                              'Remove',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.red[300],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  const SizedBox(height: 8),
+                ],
+                Row(
+                  children: [
+                    DropdownButton<String>(
+                      value: _service,
+                      items: const [
+                        DropdownMenuItem(
+                          value: 'anthropic',
+                          child: Text('anthropic'),
+                        ),
+                        DropdownMenuItem(
+                          value: 'openai',
+                          child: Text('openai'),
+                        ),
+                      ],
+                      onChanged: (value) {
+                        if (value != null) setState(() => _service = value);
+                      },
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: TextField(
+                        controller: _serviceKeyController,
+                        obscureText: true,
+                        decoration: const InputDecoration(
+                          labelText: 'Provider API key',
+                          hintText: 'sk-...',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    FilledButton(
+                      onPressed: _serverKeyBusy ? null : _saveServerKey,
+                      child: const Text('Store on Server'),
+                    ),
+                  ],
+                ),
+                if (_serverKeyStatus != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(
+                      _serverKeyStatus!,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: _serverKeyStatus!.startsWith('Failed')
+                            ? Colors.red[300]
+                            : Colors.green,
+                      ),
+                    ),
+                  ),
+              ],
             ],
           ),
         ),
