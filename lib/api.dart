@@ -341,11 +341,13 @@ No markdown, no backticks, no explanations. Only JSON.''';
   /// One AI conversation turn using the caller's stored provider key.
   /// Tool calls dispatch with the caller's credentials — the AI can do
   /// exactly what the session could, permission-checked and audited.
+  /// [history] is prior turns as [{role, content}] (server caps at 40).
   Future<Map<String, dynamic>> aiChat({
     required String message,
     String? model,
     List<String>? tools,
     int? maxRounds,
+    List<Map<String, String>>? history,
   }) {
     return rawRequest(
       'POST',
@@ -355,7 +357,62 @@ No markdown, no backticks, no explanations. Only JSON.''';
         if (model != null && model.isNotEmpty) 'model': model,
         if (tools != null) 'tools': tools,
         if (maxRounds != null) 'max_rounds': maxRounds,
+        if (history != null && history.isNotEmpty) 'history': history,
       },
+    );
+  }
+
+  // --- Caller-scoped record routes (/collections/*) ---
+  // Unlike the admin routes these run inside the permission engine: rows
+  // arrive pre-filtered for the session's user, which is what shell
+  // history/preferences want.
+
+  Future<Map<String, dynamic>> listUserCollectionRecords(
+    String collection, {
+    int limit = 100,
+  }) {
+    return rawRequest(
+      'GET',
+      _objUrl('collections/${_pathSegment(collection)}/records?limit=$limit'),
+    );
+  }
+
+  Future<Map<String, dynamic>> getUserCollectionRecord(
+    String collection,
+    String recordId,
+  ) {
+    return rawRequest(
+      'GET',
+      _objUrl(
+        'collections/${_pathSegment(collection)}/records/'
+        '${_pathSegment(recordId)}',
+      ),
+    );
+  }
+
+  Future<Map<String, dynamic>> putUserCollectionRecord(
+    String collection,
+    String recordId,
+    Map<String, dynamic> changes,
+  ) {
+    return rawRequest(
+      'PUT',
+      _objUrl(
+        'collections/${_pathSegment(collection)}/records/'
+        '${_pathSegment(recordId)}',
+      ),
+      data: changes,
+    );
+  }
+
+  Future<Map<String, dynamic>> createUserCollectionRecord(
+    String collection,
+    Map<String, dynamic> record,
+  ) {
+    return rawRequest(
+      'POST',
+      _objUrl('collections/${_pathSegment(collection)}/records'),
+      data: record,
     );
   }
 

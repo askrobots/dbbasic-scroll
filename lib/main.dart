@@ -13365,6 +13365,8 @@ class _AIChatViewState extends State<AIChatView> {
   final List<_ChatTurn> _turns = [];
   String _model = 'anthropic:claude-haiku-4-5';
   bool _sending = false;
+  int _replayedTurns = 0;
+  bool _prefsRecordExists = false;
 
   static const _models = [
     'anthropic:claude-haiku-4-5',
@@ -13373,6 +13375,12 @@ class _AIChatViewState extends State<AIChatView> {
     'openai:gpt-4o-mini',
     'openai:gpt-4o',
   ];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadShellState();
+  }
 
   @override
   void dispose() {
@@ -13387,9 +13395,113 @@ class _AIChatViewState extends State<AIChatView> {
       if (tool.trim().isNotEmpty) tool.trim(),
   ];
 
+  /// Preferences + history live in shell_preferences / shell_commands
+  /// records shared with the web /shell page, so both surfaces stay in
+  /// sync and a conversation continues across them.
+  Future<void> _loadShellState() async {
+    final api = ScrollAPI();
+    final userId = api.sessionUserId;
+    if (userId == null) return;
+
+    final prefsResult = await api.getUserCollectionRecord(
+      'shell_preferences',
+      userId,
+    );
+    if (!mounted) return;
+    final prefsBody = prefsResult['body'];
+    final prefs = prefsBody is Map
+        ? (prefsBody['record'] is Map ? prefsBody['record'] as Map : prefsBody)
+        : null;
+    final prefsStatus = prefsResult['status'];
+    if (prefsStatus is int && prefsStatus >= 200 && prefsStatus < 300) {
+      _prefsRecordExists = true;
+      final model = prefs?['model']?.toString();
+      final tools = prefs?['tools'];
+      setState(() {
+        if (model != null && model.isNotEmpty) _model = model;
+        if (tools is List && tools.isNotEmpty) {
+          _toolsController.text = tools.join(', ');
+        } else if (tools is String && tools.trim().isNotEmpty) {
+          _toolsController.text = tools;
+        }
+      });
+    }
+
+    final logResult = await api.listUserCollectionRecords(
+      'shell_commands',
+      limit: 200,
+    );
+    if (!mounted || _turns.isNotEmpty) return;
+    final logBody = logResult['body'];
+    final rows = logBody is Map && logBody['records'] is List
+        ? (logBody['records'] as List)
+        : const [];
+    final aiRows = [
+      for (final row in rows)
+        if (row is Map && row['kind']?.toString() == 'ai') row,
+    ]..sort((a, b) => '${a['created_at']}'.compareTo('${b['created_at']}'));
+    final replay = aiRows.length > 30
+        ? aiRows.sublist(aiRows.length - 30)
+        : aiRows;
+    final turns = <_ChatTurn>[];
+    for (final row in replay) {
+      final question =
+          (row['input'] ?? row['message'] ?? row['command'] ?? row['text'])
+              ?.toString();
+      final reply = (row['reply'] ?? row['response'] ?? row['output'])
+          ?.toString();
+      if (question == null || question.isEmpty) continue;
+      turns.add(
+        _ChatTurn(question: question)
+          ..pending = false
+          ..reply = reply,
+      );
+    }
+    if (turns.isEmpty) return;
+    setState(() {
+      _turns.addAll(turns);
+      _replayedTurns = turns.length;
+    });
+    _scrollToEnd();
+  }
+
+  Future<void> _persistPreferences() async {
+    final api = ScrollAPI();
+    final userId = api.sessionUserId;
+    if (userId == null) return;
+    final changes = {'model': _model, 'tools': _tools};
+    final result = _prefsRecordExists
+        ? await api.putUserCollectionRecord(
+            'shell_preferences',
+            userId,
+            changes,
+          )
+        : await api.createUserCollectionRecord('shell_preferences', {
+            'id': userId,
+            ...changes,
+          });
+    final status = result['status'];
+    if (status is int && status >= 200 && status < 300) {
+      _prefsRecordExists = true;
+    }
+  }
+
+  /// Prior completed turns as [{role, content}] — the server caps history
+  /// at 40 entries, so send at most the last 20 exchanges.
+  List<Map<String, String>> _historyPayload() {
+    final history = <Map<String, String>>[];
+    for (final turn in _turns) {
+      if (turn.pending || turn.reply == null) continue;
+      history.add({'role': 'user', 'content': turn.question});
+      history.add({'role': 'assistant', 'content': turn.reply!});
+    }
+    return history.length > 40 ? history.sublist(history.length - 40) : history;
+  }
+
   Future<void> _send() async {
     final message = _messageController.text.trim();
     if (message.isEmpty || _sending) return;
+    final history = _historyPayload();
     final turn = _ChatTurn(question: message);
     setState(() {
       _turns.add(turn);
@@ -13401,6 +13513,7 @@ class _AIChatViewState extends State<AIChatView> {
       message: message,
       model: _model,
       tools: _tools,
+      history: history,
     );
     if (!mounted) return;
     final status = result['status'];
@@ -13462,14 +13575,16 @@ class _AIChatViewState extends State<AIChatView> {
                 value: _model,
                 style: const TextStyle(fontSize: 12, color: Colors.white70),
                 dropdownColor: Theme.of(context).colorScheme.surfaceContainer,
-                items: _models
+                items: {..._models, _model}
                     .map(
                       (model) =>
                           DropdownMenuItem(value: model, child: Text(model)),
                     )
                     .toList(),
                 onChanged: (value) {
-                  if (value != null) setState(() => _model = value);
+                  if (value == null) return;
+                  setState(() => _model = value);
+                  _persistPreferences();
                 },
               ),
             ],
@@ -13477,11 +13592,14 @@ class _AIChatViewState extends State<AIChatView> {
           const SizedBox(height: 8),
           TextField(
             controller: _toolsController,
+            onSubmitted: (_) => _persistPreferences(),
+            onEditingComplete: _persistPreferences,
             decoration: const InputDecoration(
               labelText: 'Tools (comma-separated MCP tool names)',
               helperText:
                   'Any subset of the server\'s MCP catalog — a small list '
-                  'keeps fast models fast. Empty = no tools.',
+                  'keeps fast models fast. Empty = no tools. Model + tools '
+                  'sync with the web /shell via shell_preferences.',
               border: OutlineInputBorder(),
               isDense: true,
             ),
@@ -13505,14 +13623,30 @@ class _AIChatViewState extends State<AIChatView> {
                     child: Text(
                       'Ask the server\'s AI anything — it can call the MCP '
                       'tools above with your session\'s permissions.\n'
-                      'Each message is one independent turn (no memory yet).',
+                      'Conversations continue across Scroll and the web '
+                      '/shell page.',
                       textAlign: TextAlign.center,
                       style: TextStyle(color: Colors.white38, fontSize: 13),
                     ),
                   )
                 : ListView(
                     controller: _chatScroll,
-                    children: [for (final turn in _turns) _turnWidget(turn)],
+                    children: [
+                      if (_replayedTurns > 0)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 4),
+                          child: Text(
+                            '↺ resumed $_replayedTurns turn'
+                            '${_replayedTurns == 1 ? '' : 's'} from the '
+                            'shell log',
+                            style: const TextStyle(
+                              fontSize: 11,
+                              color: Colors.white30,
+                            ),
+                          ),
+                        ),
+                      for (final turn in _turns) _turnWidget(turn),
+                    ],
                   ),
           ),
           const SizedBox(height: 12),
