@@ -362,6 +362,27 @@ No markdown, no backticks, no explanations. Only JSON.''';
     );
   }
 
+  /// Ops event stream: object execution failures + auth activity.
+  /// kind: execution_error | auth; event: e.g. login_failed.
+  Future<Map<String, dynamic>> listAdminOpsEvents({
+    String? kind,
+    String? event,
+    String? identifier,
+    int limit = 200,
+  }) {
+    var query = 'limit=$limit';
+    if (kind != null && kind.isNotEmpty) {
+      query += '&kind=${Uri.encodeQueryComponent(kind)}';
+    }
+    if (event != null && event.isNotEmpty) {
+      query += '&event=${Uri.encodeQueryComponent(event)}';
+    }
+    if (identifier != null && identifier.isNotEmpty) {
+      query += '&identifier=${Uri.encodeQueryComponent(identifier)}';
+    }
+    return rawRequest('GET', _objUrl('admin/ops?$query'));
+  }
+
   // --- Caller-scoped record routes (/collections/*) ---
   // Unlike the admin routes these run inside the permission engine: rows
   // arrive pre-filtered for the session's user, which is what shell
@@ -605,11 +626,16 @@ No markdown, no backticks, no explanations. Only JSON.''';
     return result is Map<String, dynamic> ? result : null;
   }
 
-  Future<Map<String, dynamic>?> getHealth({bool metrics = false}) async {
-    final url = metrics
-        ? _objUrl('health?metrics=true&format=json')
-        : _objUrl('health?format=json');
-    final result = await _getRaw(url);
+  Future<Map<String, dynamic>?> getHealth({
+    bool metrics = false,
+    bool history = false,
+    int historyLimit = 360,
+  }) async {
+    var url = metrics
+        ? 'health?metrics=true&format=json'
+        : 'health?format=json';
+    if (history) url += '&history=true&history_limit=$historyLimit';
+    final result = await _getRaw(_objUrl(url));
     return result is Map<String, dynamic> ? result : null;
   }
 

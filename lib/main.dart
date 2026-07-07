@@ -758,6 +758,7 @@ class _MainShellState extends State<MainShell> {
     _NavItem('SQL', Icons.terminal_outlined),
     _NavItem('Daemon', Icons.hub_outlined),
     _NavItem('Changes', Icons.manage_history_outlined),
+    _NavItem('Ops', Icons.monitor_heart_outlined),
     _NavItem('Files', Icons.folder_outlined),
     _NavItem('Schema', Icons.schema_outlined),
     _NavItem('Diagram', Icons.account_tree_outlined),
@@ -873,11 +874,12 @@ class _MainShellState extends State<MainShell> {
       9 => const SQLQueryView(),
       10 => const DaemonStatusView(),
       11 => const ChangesView(),
-      12 => const FileManagerView(),
-      13 => const SchemaEditorView(),
-      14 => const DiagramView(),
-      15 => const PackageManagerView(),
-      16 => const BackupView(),
+      12 => const OpsEventsView(),
+      13 => const FileManagerView(),
+      14 => const SchemaEditorView(),
+      15 => const DiagramView(),
+      16 => const PackageManagerView(),
+      17 => const BackupView(),
       _ => SwitchboardView(onNavigate: _navigate),
     };
   }
@@ -3874,6 +3876,52 @@ class ReportView extends StatelessWidget {
 // Station Monitor (admin)
 // ---------------------------------------------------------------------------
 
+/// Polyline sparklines for the Stations trend tiles. All series in one
+/// paint share a vertical scale so p50/p95 (or cpu/mem) compare honestly.
+class _SparklinePainter extends CustomPainter {
+  _SparklinePainter({required this.series});
+
+  final List<(List<double>, Color)> series;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    var min = double.infinity;
+    var max = double.negativeInfinity;
+    for (final (values, _) in series) {
+      for (final value in values) {
+        if (value < min) min = value;
+        if (value > max) max = value;
+      }
+    }
+    if (!min.isFinite || !max.isFinite) return;
+    final span = (max - min) == 0 ? 1.0 : (max - min);
+
+    for (final (values, color) in series) {
+      if (values.length < 2) continue;
+      final paint = Paint()
+        ..color = color
+        ..strokeWidth = 1.5
+        ..style = PaintingStyle.stroke
+        ..strokeJoin = StrokeJoin.round;
+      final path = Path();
+      for (var i = 0; i < values.length; i++) {
+        final x = i / (values.length - 1) * size.width;
+        final y = size.height - ((values[i] - min) / span * size.height);
+        if (i == 0) {
+          path.moveTo(x, y);
+        } else {
+          path.lineTo(x, y);
+        }
+      }
+      canvas.drawPath(path, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_SparklinePainter oldDelegate) =>
+      oldDelegate.series != series;
+}
+
 class StationMonitor extends StatefulWidget {
   final void Function(String, Widget, [IconData])? onNavigate;
   const StationMonitor({super.key, this.onNavigate});
@@ -3886,6 +3934,7 @@ class _StationMonitorState extends State<StationMonitor> {
   String? _selectedStation;
   bool _refreshing = false;
   String? _refreshError;
+  List<Map<String, dynamic>> _history = [];
 
   @override
   void initState() {
@@ -3901,12 +3950,96 @@ class _StationMonitorState extends State<StationMonitor> {
     });
     try {
       await ScrollData().loadAll();
+      // Metrics history snapshots (~1/min while traffic flows, survives
+      // restarts) — feeds the trend sparklines.
+      final health = await ScrollAPI().getHealth(metrics: true, history: true);
+      final rows = health?['history'];
+      _history = [
+        if (rows is List)
+          for (final row in rows)
+            if (row is Map)
+              Map<String, dynamic>.from(
+                row.map((k, v) => MapEntry(k.toString(), v)),
+              ),
+      ];
     } catch (e) {
       _refreshError = e.toString();
     }
     if (mounted) {
       setState(() => _refreshing = false);
     }
+  }
+
+  List<double> _series(String key) => [
+    for (final row in _history)
+      if (row[key] is num) (row[key] as num).toDouble(),
+  ];
+
+  Widget _trendTile(
+    BuildContext context,
+    String title, {
+    required Map<String, (List<double>, Color)> series,
+  }) {
+    final present = {
+      for (final entry in series.entries)
+        if (entry.value.$1.length >= 2) entry.key: entry.value,
+    };
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surfaceContainerLow,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.white10),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    title,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 11, color: Colors.white54),
+                  ),
+                ),
+                for (final entry in present.entries)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 8),
+                    child: Text(
+                      '${entry.key} '
+                      '${entry.value.$1.last.toStringAsFixed(1)}',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontFamily: 'monospace',
+                        color: entry.value.$2,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              height: 40,
+              width: double.infinity,
+              child: present.isEmpty
+                  ? const Center(
+                      child: Text('—', style: TextStyle(color: Colors.white24)),
+                    )
+                  : CustomPaint(
+                      painter: _SparklinePainter(
+                        series: [
+                          for (final entry in present.values)
+                            (entry.$1, entry.$2),
+                        ],
+                      ),
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -4063,6 +4196,48 @@ class _StationMonitorState extends State<StationMonitor> {
                 ],
               ),
             ),
+
+          if (_history.length >= 2) ...[
+            const SizedBox(height: 24),
+            Text(
+              'Trends (metrics history)',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              '${_history.length} snapshots, ~1/min while traffic flows — '
+              'survives restarts.',
+              style: TextStyle(fontSize: 12, color: Colors.white38),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                _trendTile(
+                  context,
+                  'Response (ms)',
+                  series: {
+                    'p50': (_series('p50_ms'), Colors.orange),
+                    'p95': (_series('p95_ms'), Colors.red),
+                  },
+                ),
+                const SizedBox(width: 12),
+                _trendTile(
+                  context,
+                  'Requests/sec',
+                  series: {'rps': (_series('rps'), Colors.blue)},
+                ),
+                const SizedBox(width: 12),
+                _trendTile(
+                  context,
+                  'CPU / Memory %',
+                  series: {
+                    'cpu': (_series('cpu_percent'), Colors.orange),
+                    'mem': (_series('memory_used_percent'), Colors.purple),
+                  },
+                ),
+              ],
+            ),
+          ],
 
           const SizedBox(height: 24),
           Text(
@@ -8461,7 +8636,16 @@ class _CollectionBrowserState extends State<CollectionBrowser> {
       title: 'Records',
       icon: Icons.article_outlined,
       color: Colors.teal,
-      trailing: _chip('${_records.length}', Colors.teal),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (_schemaSpec.listMode != 'table') ...[
+            _chip(_schemaSpec.listMode.toUpperCase(), Colors.purple),
+            const SizedBox(width: 6),
+          ],
+          _chip('${_records.length}', Colors.teal),
+        ],
+      ),
       child: _records.isEmpty
           ? Center(
               child: Text(
@@ -8481,7 +8665,6 @@ class _CollectionBrowserState extends State<CollectionBrowser> {
                 final selected =
                     id.isNotEmpty &&
                     id == _recordId(_selectedRecord ?? const {});
-                final preview = _recordPreview(record);
                 return InkWell(
                   borderRadius: BorderRadius.circular(6),
                   onTap: () => _selectRecord(record),
@@ -8500,35 +8683,154 @@ class _CollectionBrowserState extends State<CollectionBrowser> {
                             : Colors.white10,
                       ),
                     ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          id.isEmpty ? 'record ${index + 1}' : id,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            fontWeight: FontWeight.w600,
-                            fontFamily: 'monospace',
-                          ),
-                        ),
-                        if (preview.isNotEmpty) ...[
-                          const SizedBox(height: 4),
-                          Text(
-                            preview,
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: Colors.white54,
-                            ),
-                          ),
-                        ],
-                      ],
-                    ),
+                    // views.list_mode picks the reading mode for the row.
+                    child: switch (_schemaSpec.listMode) {
+                      'cards' => _recordCardTile(record, id, index),
+                      'feed' => _recordFeedTile(record, id, index),
+                      _ => _recordTableTile(record, id, index),
+                    },
                   ),
                 );
               },
             ),
+    );
+  }
+
+  Widget _recordTableTile(Map<String, dynamic> record, String id, int index) {
+    final preview = _recordPreview(record);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          id.isEmpty ? 'record ${index + 1}' : id,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            fontWeight: FontWeight.w600,
+            fontFamily: 'monospace',
+          ),
+        ),
+        if (preview.isNotEmpty) ...[
+          const SizedBox(height: 4),
+          Text(
+            preview,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 12, color: Colors.white54),
+          ),
+        ],
+      ],
+    );
+  }
+
+  /// First non-empty list-field value — the record's display title in
+  /// cards/feed modes.
+  String _recordListTitle(Map<String, dynamic> record, String id, int index) {
+    for (final key in _schemaSpec.listFields) {
+      final value = record[key];
+      if (_hasValue(value)) return _valueText(value);
+    }
+    return id.isEmpty ? 'record ${index + 1}' : id;
+  }
+
+  Widget _recordCardTile(Map<String, dynamic> record, String id, int index) {
+    final fields = _schemaSpec.listFields;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          _recordListTitle(record, id, index),
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 4),
+        for (final key in fields.skip(1))
+          if (_hasValue(record[key]) && key != 'is_public')
+            Text(
+              '${_titleCase(key)}: ${_valueText(record[key])}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11, color: Colors.white54),
+            ),
+        const SizedBox(height: 4),
+        Row(
+          children: [
+            if (record.containsKey('is_public'))
+              Padding(
+                padding: const EdgeInsets.only(right: 8),
+                child: _chip(
+                  schemaBoolIsTrue(record['is_public']) ? 'PUBLIC' : 'PRIVATE',
+                  schemaBoolIsTrue(record['is_public'])
+                      ? Colors.green
+                      : Colors.blueGrey,
+                ),
+              ),
+            Expanded(
+              child: Text(
+                id,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 10,
+                  fontFamily: 'monospace',
+                  color: Colors.white30,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _recordFeedTile(Map<String, dynamic> record, String id, int index) {
+    final fields = _schemaSpec.listFields;
+    final when = (record['created_at'] ?? record['updated_at'] ?? record['at'])
+        ?.toString();
+    // The longest remaining list-field value reads as the entry body.
+    String? body;
+    for (final key in fields.skip(1)) {
+      final value = record[key];
+      if (!_hasValue(value)) continue;
+      final text = _valueText(value);
+      if (body == null || text.length > body.length) body = text;
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                _recordListTitle(record, id, index),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            if (when != null)
+              Text(
+                when.length > 16 ? when.substring(0, 16) : when,
+                style: const TextStyle(
+                  fontSize: 10,
+                  fontFamily: 'monospace',
+                  color: Colors.white30,
+                ),
+              ),
+          ],
+        ),
+        if (body != null) ...[
+          const SizedBox(height: 4),
+          Text(
+            body,
+            maxLines: 4,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 12, color: Colors.white70, height: 1.3),
+          ),
+        ],
+      ],
     );
   }
 
@@ -14246,6 +14548,339 @@ class _GlobalSearchViewState extends State<GlobalSearchView> {
   }
 
   Widget _searchChip(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+          color: color,
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// OPS EVENTS — GET /admin/ops. One admin-gated stream: object execution
+// failures + auth activity (login_failed rows are what the lockout gate
+// reads, login_locked marks a tripped lock). Never contains key material.
+// ---------------------------------------------------------------------------
+
+class OpsEventsView extends StatefulWidget {
+  const OpsEventsView({super.key});
+
+  @override
+  State<OpsEventsView> createState() => _OpsEventsViewState();
+}
+
+class _OpsEventsViewState extends State<OpsEventsView> {
+  final _identifierController = TextEditingController();
+  String _kind = 'All';
+  List<Map<String, dynamic>> _events = [];
+  bool _loading = true;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _identifierController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    final result = await ScrollAPI().listAdminOpsEvents(
+      kind: _kind == 'All' ? null : _kind,
+      identifier: _identifierController.text.trim(),
+    );
+    if (!mounted) return;
+    final status = result['status'];
+    final body = result['body'];
+    if (status is! int || status < 200 || status >= 300) {
+      setState(() {
+        _loading = false;
+        _error = 'HTTP ${status ?? result['error'] ?? '?'}';
+      });
+      return;
+    }
+    final raw = body is Map
+        ? (body['events'] ?? body['items'] ?? body['results'])
+        : body;
+    setState(() {
+      _loading = false;
+      _events = [
+        if (raw is List)
+          for (final event in raw)
+            if (event is Map)
+              Map<String, dynamic>.from(
+                event.map((k, v) => MapEntry(k.toString(), v)),
+              ),
+      ];
+    });
+  }
+
+  Color _eventColor(Map<String, dynamic> event) {
+    if (event['kind']?.toString() == 'execution_error') return Colors.red;
+    return switch (event['event']?.toString()) {
+      'login_failed' => Colors.orange,
+      'login_locked' => Colors.red,
+      'login_succeeded' => Colors.green,
+      'session_minted' => Colors.blue,
+      'logout' => Colors.blueGrey,
+      _ => Colors.purple,
+    };
+  }
+
+  String _eventTitle(Map<String, dynamic> event) {
+    if (event['kind']?.toString() == 'execution_error') {
+      final object = event['object_id'] ?? '?';
+      final method = event['method'] ?? '';
+      return 'execution_error  $object${method == '' ? '' : '.$method'}';
+    }
+    return (event['event'] ?? 'auth').toString();
+  }
+
+  String _eventDetail(Map<String, dynamic> event) {
+    final parts = <String>[];
+    for (final key in const [
+      'identifier',
+      'user_id',
+      'auth_method',
+      'label',
+      'error_type',
+      'message',
+      'correlation_id',
+    ]) {
+      final value = event[key];
+      if (value != null && value.toString().trim().isNotEmpty) {
+        parts.add('$key: $value');
+      }
+    }
+    return parts.join('  ·  ');
+  }
+
+  void _showEvent(Map<String, dynamic> event) {
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(_eventTitle(event)),
+        content: SizedBox(
+          width: 560,
+          child: SingleChildScrollView(
+            child: SelectableText(
+              const JsonEncoder.withIndent('  ').convert(event),
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('Ops Events', style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(width: 8),
+              _opsChip('READ ONLY', Colors.green),
+              const SizedBox(width: 8),
+              _opsChip('GET /admin/ops', Colors.blue),
+              const SizedBox(width: 12),
+              Text(
+                '${_events.length} events',
+                style: TextStyle(fontSize: 13, color: Colors.white38),
+              ),
+              const Spacer(),
+              if (_loading)
+                const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              const SizedBox(width: 8),
+              OutlinedButton.icon(
+                onPressed: _loading ? null : _load,
+                icon: const Icon(Icons.refresh, size: 16),
+                label: const Text('Refresh'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Container(
+                width: 180,
+                height: 38,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.04),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.white10),
+                ),
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<String>(
+                    value: _kind,
+                    isExpanded: true,
+                    dropdownColor: Theme.of(
+                      context,
+                    ).colorScheme.surfaceContainer,
+                    icon: const Icon(Icons.expand_more, size: 16),
+                    style: const TextStyle(fontSize: 12, color: Colors.white70),
+                    items: const ['All', 'auth', 'execution_error']
+                        .map(
+                          (kind) =>
+                              DropdownMenuItem(value: kind, child: Text(kind)),
+                        )
+                        .toList(),
+                    onChanged: (value) {
+                      if (value == null) return;
+                      setState(() => _kind = value);
+                      _load();
+                    },
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              SizedBox(
+                width: 240,
+                height: 38,
+                child: TextField(
+                  controller: _identifierController,
+                  onSubmitted: (_) => _load(),
+                  decoration: InputDecoration(
+                    hintText: 'identifier (e.g. dan@q9.is)',
+                    hintStyle: const TextStyle(fontSize: 12),
+                    prefixIcon: const Icon(Icons.person_search, size: 16),
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(vertical: 9),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ),
+              const SizedBox(width: 10),
+              FilledButton.icon(
+                onPressed: _loading ? null : _load,
+                icon: const Icon(Icons.filter_alt_outlined, size: 16),
+                label: const Text('Apply'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Text(
+                'Failed to load ops events: $_error',
+                style: TextStyle(color: Colors.red[300], fontSize: 12),
+              ),
+            ),
+          Expanded(
+            child: _loading && _events.isEmpty
+                ? const Center(child: CircularProgressIndicator())
+                : _events.isEmpty
+                ? const Center(
+                    child: Text(
+                      'No ops events',
+                      style: TextStyle(color: Colors.white38),
+                    ),
+                  )
+                : ListView.separated(
+                    itemCount: _events.length,
+                    separatorBuilder: (_, __) =>
+                        const Divider(height: 1, color: Colors.white10),
+                    itemBuilder: (context, index) {
+                      final event = _events[index];
+                      final color = _eventColor(event);
+                      final when =
+                          (event['at'] ??
+                                  event['timestamp'] ??
+                                  event['created_at'] ??
+                                  '')
+                              .toString();
+                      return InkWell(
+                        onTap: () => _showEvent(event),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            vertical: 8,
+                            horizontal: 6,
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(Icons.circle, size: 8, color: color),
+                              const SizedBox(width: 10),
+                              SizedBox(
+                                width: 260,
+                                child: Text(
+                                  _eventTitle(event),
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontFamily: 'monospace',
+                                    color: color,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Text(
+                                  _eventDetail(event),
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.white54,
+                                  ),
+                                ),
+                              ),
+                              Text(
+                                when.length > 19 ? when.substring(0, 19) : when,
+                                style: const TextStyle(
+                                  fontSize: 10,
+                                  fontFamily: 'monospace',
+                                  color: Colors.white30,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _opsChip(String label, Color color) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
