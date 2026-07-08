@@ -675,6 +675,50 @@ No markdown, no backticks, no explanations. Only JSON.''';
     return result is Map<String, dynamic> ? result : null;
   }
 
+  // --- Backups (admin-gated; a backup contains ALL data, never public) ---
+
+  /// GET /admin/backups → {backups: [{id, created_at, size, kind, scope}],
+  /// count, schedule} newest-first.
+  Future<Map<String, dynamic>> listBackups() {
+    return rawRequest('GET', _objUrl('admin/backups'));
+  }
+
+  /// POST /admin/backups → 201 {backup: {...}} — creates a full-runtime
+  /// backup now. Synchronous; returns the finished record.
+  Future<Map<String, dynamic>> createBackup() {
+    return rawRequest('POST', _objUrl('admin/backups'));
+  }
+
+  /// GET /admin/backups/{id}/download → the archive bytes. Returns the raw
+  /// bytes plus the server-suggested filename, or null on failure.
+  Future<({List<int> bytes, String filename})?> downloadBackup(
+    String id,
+  ) async {
+    final uri = Uri.parse(
+      _objUrl('admin/backups/${_pathSegment(id)}/download'),
+    );
+    try {
+      final response = await _client.get(uri, headers: _headers());
+      _noteAuthResult(response.statusCode, _AuthMode.objectServer);
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        var filename = 'backup-$id.tar.gz';
+        final disposition = response.headers['content-disposition'];
+        if (disposition != null) {
+          final match = RegExp(
+            'filename\\*?=(?:"([^"]+)"|([^;]+))',
+          ).firstMatch(disposition);
+          final captured = (match?.group(1) ?? match?.group(2))?.trim();
+          if (captured != null && captured.isNotEmpty) filename = captured;
+        }
+        return (bytes: response.bodyBytes, filename: filename);
+      }
+      lastError = 'HTTP ${response.statusCode}';
+    } catch (e) {
+      lastError = 'Error: $e';
+    }
+    return null;
+  }
+
   Future<Map<String, dynamic>?> getDaemonStatus() async {
     final result = await _getRaw(_objUrl('daemon/status'));
     return result is Map<String, dynamic> ? result : null;

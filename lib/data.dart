@@ -222,6 +222,19 @@ class ScrollData {
       _boolFromDynamic(backupCapability['available']) == true ||
       _boolFromDynamic(backupCapability['api_exposed']) == true;
 
+  bool get backupCanCreate =>
+      _boolFromDynamic(backupCapability['can_create']) == true;
+  bool get backupCanDownload =>
+      _boolFromDynamic(backupCapability['can_download']) == true;
+  bool get backupCanRestore =>
+      _boolFromDynamic(backupCapability['can_restore']) == true;
+  bool get backupScheduled =>
+      _boolFromDynamic(backupCapability['scheduled']) == true;
+  String? get backupSchedule =>
+      backupCapability['schedule']?.toString().trim().isNotEmpty == true
+      ? backupCapability['schedule'].toString()
+      : null;
+
   Map<String, dynamic> get fileWritesCapability {
     return _mapAt(const [
       ['capabilities', 'file_writes'],

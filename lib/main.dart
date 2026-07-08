@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'api.dart';
 import 'data.dart';
@@ -19798,14 +19799,134 @@ class SQLQueryView extends StatelessWidget {
 // Backup & Restore (admin)
 // ---------------------------------------------------------------------------
 
-class BackupView extends StatelessWidget {
+class BackupView extends StatefulWidget {
   const BackupView({super.key});
+
+  @override
+  State<BackupView> createState() => _BackupViewState();
+}
+
+class _BackupViewState extends State<BackupView> {
+  List<Map<String, dynamic>> _backups = [];
+  bool _loading = true;
+  bool _creating = false;
+  String? _downloadingId;
+  String? _error;
+  String? _status;
+  bool _statusIsError = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  Future<void> _refresh() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    // Refresh capabilities (the flags may predate the backup-API deploy)
+    // and the inventory together.
+    final status = await ScrollAPI().getAdminStatus();
+    final result = await ScrollAPI().listBackups();
+    if (!mounted) return;
+    if (status != null) ScrollData().adminStatus = status;
+    final code = result['status'];
+    final body = result['body'];
+    if (code is int && code >= 200 && code < 300 && body is Map) {
+      final raw = body['backups'];
+      setState(() {
+        _backups = [
+          if (raw is List)
+            for (final b in raw)
+              if (b is Map)
+                Map<String, dynamic>.from(
+                  b.map((k, v) => MapEntry(k.toString(), v)),
+                ),
+        ];
+        _loading = false;
+      });
+    } else {
+      setState(() {
+        _loading = false;
+        // 404/401 here just means the capability isn't live for this
+        // session; the locked placeholder covers it.
+        _error = code is int && code != 200 ? 'HTTP $code' : null;
+      });
+    }
+  }
+
+  Future<void> _backupNow() async {
+    setState(() {
+      _creating = true;
+      _status = null;
+    });
+    final result = await ScrollAPI().createBackup();
+    if (!mounted) return;
+    final code = result['status'];
+    final ok = code is int && code >= 200 && code < 300;
+    setState(() {
+      _creating = false;
+      _statusIsError = !ok;
+      _status = ok
+          ? 'Backup created.'
+          : 'Backup failed: HTTP ${code ?? result['error'] ?? '?'}';
+    });
+    if (ok) _refresh();
+  }
+
+  Future<void> _download(Map<String, dynamic> backup) async {
+    final id = backup['id']?.toString();
+    if (id == null || id.isEmpty) return;
+    setState(() {
+      _downloadingId = id;
+      _status = null;
+    });
+    final result = await ScrollAPI().downloadBackup(id);
+    if (!mounted) return;
+    if (result == null) {
+      setState(() {
+        _downloadingId = null;
+        _statusIsError = true;
+        _status = 'Download failed: ${ScrollAPI().lastError ?? 'error'}';
+      });
+      return;
+    }
+    // Native Save dialog — sandbox-safe: the user's choice grants write
+    // access to that location.
+    try {
+      final location = await getSaveLocation(suggestedName: result.filename);
+      if (location == null) {
+        if (mounted) setState(() => _downloadingId = null);
+        return; // cancelled
+      }
+      await File(location.path).writeAsBytes(result.bytes);
+      if (!mounted) return;
+      setState(() {
+        _downloadingId = null;
+        _statusIsError = false;
+        _status =
+            'Saved ${_formatSize(result.bytes.length)} to '
+            '${location.path}';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _downloadingId = null;
+        _statusIsError = true;
+        _status = 'Could not save file: $e';
+      });
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final data = ScrollData();
     final capability = data.backupCapability;
     final apiExposed = data.backupApiExposed;
+    final canCreate = data.backupCanCreate;
+    final canRestore = data.backupCanRestore;
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
@@ -19821,23 +19942,37 @@ class BackupView extends StatelessWidget {
               const SizedBox(width: 10),
               _chip(
                 apiExposed ? 'BACKUP API AVAILABLE' : 'Backup API not exposed',
-                apiExposed ? Colors.orange : Colors.green,
+                apiExposed ? Colors.green : Colors.white54,
               ),
               const Spacer(),
-              Tooltip(
-                message: 'Scheduling not configured',
-                child: OutlinedButton.icon(
-                  onPressed: null,
-                  icon: const Icon(Icons.schedule, size: 16),
-                  label: const Text('Schedule'),
+              if (_loading)
+                const Padding(
+                  padding: EdgeInsets.only(right: 12),
+                  child: SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
                 ),
+              OutlinedButton.icon(
+                onPressed: _loading ? null : _refresh,
+                icon: const Icon(Icons.refresh, size: 16),
+                label: const Text('Refresh'),
               ),
               const SizedBox(width: 8),
               Tooltip(
-                message: 'Backup API not exposed',
+                message: canCreate
+                    ? 'Create a full-runtime backup now'
+                    : 'Backup creation not available for this session',
                 child: FilledButton.icon(
-                  onPressed: null,
-                  icon: const Icon(Icons.backup, size: 16),
+                  onPressed: (canCreate && !_creating) ? _backupNow : null,
+                  icon: _creating
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.backup, size: 16),
                   label: const Text('Backup Now'),
                 ),
               ),
@@ -19845,9 +19980,54 @@ class BackupView extends StatelessWidget {
           ),
           const SizedBox(height: 8),
           Text(
-            'General backup inventory, creation, download, restore, and scheduling are not exposed through a public admin API yet.',
+            apiExposed
+                ? 'On-demand backups run now and can be downloaded. A backup '
+                      'contains all runtime data (including credentials), so '
+                      'these routes are admin-only. Restore stays a CLI '
+                      'operation on the server.'
+                : 'Backup inventory, creation, and download are not exposed '
+                      'through the admin API for this session.',
             style: TextStyle(fontSize: 12, color: Colors.white38),
           ),
+          if (_status != null) ...[
+            const SizedBox(height: 10),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: (_statusIsError ? Colors.red : Colors.green).withValues(
+                  alpha: 0.12,
+                ),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    _statusIsError ? Icons.error_outline : Icons.check_circle,
+                    size: 16,
+                    color: _statusIsError ? Colors.red[300] : Colors.green,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: SelectableText(
+                      _status!,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: _statusIsError
+                            ? Colors.red[200]
+                            : Colors.green[200],
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => setState(() => _status = null),
+                    icon: const Icon(Icons.close, size: 14),
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ],
+              ),
+            ),
+          ],
           const SizedBox(height: 16),
           Wrap(
             spacing: 12,
@@ -19858,82 +20038,40 @@ class BackupView extends StatelessWidget {
                 'Backup API',
                 apiExposed ? 'available' : 'not exposed',
                 Icons.backup_outlined,
-                apiExposed ? Colors.orange : Colors.green,
+                apiExposed ? Colors.green : Colors.white54,
               ),
               _backupStat(
                 context,
-                'Restore',
-                'locked',
-                Icons.restore_outlined,
-                Colors.green,
+                'Create',
+                canCreate ? 'available' : 'locked',
+                Icons.add_circle_outline,
+                canCreate ? Colors.green : Colors.white54,
               ),
               _backupStat(
                 context,
                 'Download',
-                'locked',
+                data.backupCanDownload ? 'available' : 'locked',
                 Icons.download_outlined,
-                Colors.green,
+                data.backupCanDownload ? Colors.green : Colors.white54,
+              ),
+              _backupStat(
+                context,
+                'Restore',
+                canRestore ? 'available' : 'CLI only',
+                Icons.restore_outlined,
+                canRestore ? Colors.green : Colors.orange,
               ),
               _backupStat(
                 context,
                 'Schedule',
-                'not configured',
+                data.backupScheduled ? (data.backupSchedule ?? 'on') : 'off',
                 Icons.schedule_outlined,
-                Colors.white54,
+                data.backupScheduled ? Colors.green : Colors.white54,
               ),
             ],
           ),
           const SizedBox(height: 24),
-          LayoutBuilder(
-            builder: (context, constraints) {
-              final cards = [
-                _statusPanel(
-                  context,
-                  title: 'Backup Posture',
-                  icon: Icons.shield_outlined,
-                  color: Colors.green,
-                  rows: [
-                    MapEntry('inventory', 'Backup API not exposed'),
-                    MapEntry('create', 'Backup API not exposed'),
-                    MapEntry('download', 'Download locked'),
-                    MapEntry('restore', 'Restore locked'),
-                    MapEntry('schedule', 'Scheduling not configured'),
-                  ],
-                ),
-                _statusPanel(
-                  context,
-                  title: 'Backend State',
-                  icon: Icons.storage_outlined,
-                  color: Colors.blue,
-                  rows: [
-                    MapEntry('runtime_helper', 'object_backup.py / CLI'),
-                    MapEntry('restore_points', 'package install scoped'),
-                    MapEntry('package_restore', 'not general backup API'),
-                    MapEntry('public_staging', 'locked'),
-                  ],
-                ),
-              ];
-              if (constraints.maxWidth < 900) {
-                return Column(
-                  children: [
-                    cards.first,
-                    const SizedBox(height: 12),
-                    cards.last,
-                  ],
-                );
-              }
-              return Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Expanded(child: cards.first),
-                  const SizedBox(width: 12),
-                  Expanded(child: cards.last),
-                ],
-              );
-            },
-          ),
-          const SizedBox(height: 16),
-          _inventoryPanel(context),
+          _inventoryPanel(context, apiExposed),
           if (capability.isNotEmpty) ...[
             const SizedBox(height: 16),
             _rawPanel('Raw backup capability', capability),
@@ -19943,7 +20081,7 @@ class BackupView extends StatelessWidget {
     );
   }
 
-  Widget _inventoryPanel(BuildContext context) {
+  Widget _inventoryPanel(BuildContext context, bool apiExposed) {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
@@ -19964,54 +20102,128 @@ class BackupView extends StatelessWidget {
                 style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
               ),
               const Spacer(),
-              _chip('EMPTY', Colors.white54),
+              _chip(
+                _backups.isEmpty ? 'EMPTY' : '${_backups.length}',
+                _backups.isEmpty ? Colors.white54 : Colors.teal,
+              ),
             ],
           ),
-          const SizedBox(height: 18),
-          Center(
-            child: Column(
-              children: [
-                Icon(Icons.lock_outline, size: 34, color: Colors.white30),
-                const SizedBox(height: 10),
-                const Text(
-                  'Backup API not exposed',
-                  style: TextStyle(fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  'No general backup history is available from `/admin/backups` yet.',
-                  textAlign: TextAlign.center,
+          const SizedBox(height: 14),
+          if (!apiExposed)
+            _lockedInventory(context)
+          else if (_backups.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              child: Center(
+                child: Text(
+                  _loading
+                      ? 'Loading backups…'
+                      : 'No backups yet — click "Backup Now" to create one.',
                   style: TextStyle(fontSize: 12, color: Colors.white38),
                 ),
-                const SizedBox(height: 14),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    Tooltip(
-                      message: 'Download locked',
-                      child: OutlinedButton.icon(
-                        onPressed: null,
-                        icon: const Icon(Icons.download_outlined, size: 16),
-                        label: const Text('Download'),
-                      ),
-                    ),
-                    Tooltip(
-                      message: 'Restore locked',
-                      child: OutlinedButton.icon(
-                        onPressed: null,
-                        icon: const Icon(Icons.restore_outlined, size: 16),
-                        label: const Text('Restore'),
-                      ),
-                    ),
-                  ],
+              ),
+            )
+          else
+            for (final backup in _backups) _backupRow(context, backup),
+        ],
+      ),
+    );
+  }
+
+  Widget _backupRow(BuildContext context, Map<String, dynamic> backup) {
+    final id = backup['id']?.toString() ?? '';
+    final kind = backup['kind']?.toString() ?? 'manual';
+    final scope = backup['scope']?.toString();
+    final created = backup['created_at']?.toString() ?? '';
+    final size = backup['size'];
+    final downloading = _downloadingId == id;
+    final kindColor = switch (kind) {
+      'manual' => Colors.teal,
+      'package' => Colors.blue,
+      'restore-point' => Colors.orange,
+      _ => Colors.white54,
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      decoration: const BoxDecoration(
+        border: Border(bottom: BorderSide(color: Colors.white10)),
+      ),
+      child: Row(
+        children: [
+          _chip(kind.toUpperCase(), kindColor),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  id,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+                ),
+                Text(
+                  [
+                    if (created.isNotEmpty)
+                      created.length > 19 ? created.substring(0, 19) : created,
+                    if (size is num) _formatSize(size.toInt()),
+                    if (scope != null && scope.isNotEmpty && scope != 'null')
+                      'scope: $scope',
+                  ].join('  ·  '),
+                  style: TextStyle(fontSize: 11, color: Colors.white38),
                 ),
               ],
             ),
           ),
+          const SizedBox(width: 10),
+          OutlinedButton.icon(
+            onPressed: (ScrollData().backupCanDownload && !downloading)
+                ? () => _download(backup)
+                : null,
+            icon: downloading
+                ? const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.download_outlined, size: 15),
+            label: const Text('Download'),
+          ),
         ],
       ),
     );
+  }
+
+  Widget _lockedInventory(BuildContext context) {
+    return Center(
+      child: Column(
+        children: [
+          const SizedBox(height: 8),
+          Icon(Icons.lock_outline, size: 34, color: Colors.white30),
+          const SizedBox(height: 10),
+          const Text(
+            'Backup API not exposed',
+            style: TextStyle(fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'This session cannot read `/admin/backups`. An admin session is '
+            'required.',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 12, color: Colors.white38),
+          ),
+          const SizedBox(height: 8),
+        ],
+      ),
+    );
+  }
+
+  String _formatSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 
   Widget _backupStat(
@@ -20052,79 +20264,6 @@ class BackupView extends StatelessWidget {
                   style: TextStyle(fontSize: 11, color: Colors.white38),
                 ),
               ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _statusPanel(
-    BuildContext context, {
-    required String title,
-    required IconData icon,
-    required Color color,
-    required List<MapEntry<String, dynamic>> rows,
-  }) {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surfaceContainerLow,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.white10),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(icon, size: 18, color: color),
-              const SizedBox(width: 8),
-              Text(
-                title,
-                style: const TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              const Spacer(),
-              _chip('READ ONLY', color),
-            ],
-          ),
-          const SizedBox(height: 12),
-          for (final row in rows) _statusRow(row.key, row.value),
-        ],
-      ),
-    );
-  }
-
-  Widget _statusRow(String label, dynamic value) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 7),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            flex: 5,
-            child: Text(
-              _titleCase(label),
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 12, color: Colors.white54),
-            ),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            flex: 7,
-            child: Text(
-              _valueText(value),
-              maxLines: 3,
-              overflow: TextOverflow.ellipsis,
-              textAlign: TextAlign.right,
-              style: TextStyle(
-                fontSize: 12,
-                color: Colors.white70,
-                fontWeight: FontWeight.w600,
-              ),
             ),
           ),
         ],
@@ -20178,26 +20317,4 @@ class BackupView extends StatelessWidget {
     );
   }
 
-  String _valueText(dynamic value) {
-    if (value == null) return '?';
-    if (value is bool) return value ? 'yes' : 'no';
-    if (value is List) return '${value.length} items';
-    if (value is Map) {
-      final entries = value.entries.take(3).map((entry) {
-        return '${_titleCase(entry.key.toString())}: ${_valueText(entry.value)}';
-      });
-      return entries.join(', ');
-    }
-    return value.toString();
-  }
-
-  String _titleCase(String value) {
-    return value
-        .replaceAll('_', ' ')
-        .replaceAll('-', ' ')
-        .split(' ')
-        .where((part) => part.isNotEmpty)
-        .map((part) => '${part[0].toUpperCase()}${part.substring(1)}')
-        .join(' ');
-  }
 }
