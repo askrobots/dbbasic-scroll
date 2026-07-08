@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'api.dart';
 import 'data.dart';
+import 'realtime.dart';
 import 'schema_form.dart';
 
 void main() {
@@ -806,6 +807,7 @@ class _MainShellState extends State<MainShell> {
             FilledButton.icon(
               onPressed: () async {
                 Navigator.of(dialogContext).pop();
+                ScrollRealtime().shutdown();
                 await ScrollAPI().disconnect();
                 ScrollData().clear();
                 if (!mounted) return;
@@ -1219,18 +1221,22 @@ class _NotificationBell extends StatefulWidget {
 class _NotificationBellState extends State<_NotificationBell> {
   List<Map<String, dynamic>> _notifications = [];
   Timer? _poll;
+  VoidCallback? _rtDispose;
   bool _loading = false;
 
   @override
   void initState() {
     super.initState();
     _load();
-    _poll = Timer.periodic(const Duration(seconds: 45), (_) => _load());
+    // Live push when the websocket is up; a slow poll covers reconnect gaps.
+    _rtDispose = ScrollRealtime().bind('notifications', _load);
+    _poll = Timer.periodic(const Duration(seconds: 120), (_) => _load());
   }
 
   @override
   void dispose() {
     _poll?.cancel();
+    _rtDispose?.call();
     super.dispose();
   }
 
@@ -1558,6 +1564,27 @@ class _StatusBar extends StatelessWidget {
                   style: TextStyle(fontSize: 11, color: Colors.white24),
                 ),
               ],
+              const SizedBox(width: 12),
+              ValueListenableBuilder<bool>(
+                valueListenable: ScrollRealtime().connected,
+                builder: (context, live, _) => Row(
+                  children: [
+                    Icon(
+                      live ? Icons.bolt : Icons.bolt_outlined,
+                      size: 12,
+                      color: live ? Colors.green : Colors.white24,
+                    ),
+                    const SizedBox(width: 2),
+                    Text(
+                      live ? 'Live' : 'Polling',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: live ? Colors.green : Colors.white24,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
               const SizedBox(width: 12),
               Text(
                 d.version.isNotEmpty ? d.version : 'v0.1.0',
@@ -8182,11 +8209,47 @@ class _CollectionBrowserState extends State<CollectionBrowser> {
   bool _writing = false;
   Map<String, dynamic>? _writeResponse;
   String? _error;
+  String? _rtCollection;
+  VoidCallback? _rtDispose;
 
   @override
   void initState() {
     super.initState();
     _loadCollections();
+  }
+
+  @override
+  void dispose() {
+    _rtDispose?.call();
+    super.dispose();
+  }
+
+  /// Keep one realtime subscription tracking the visible collection. On a
+  /// record event, quietly refetch the record list + changes without
+  /// blanking the panel or losing the selected record.
+  void _bindRealtime(String? collection) {
+    if (collection == _rtCollection) return;
+    _rtDispose?.call();
+    _rtCollection = collection;
+    _rtDispose = collection == null
+        ? null
+        : ScrollRealtime().bind(collection, _refetchRecordsQuietly);
+  }
+
+  Future<void> _refetchRecordsQuietly() async {
+    final collection = _selectedCollection;
+    if (collection == null || !mounted) return;
+    final results = await Future.wait<dynamic>([
+      ScrollAPI().listAdminCollectionRecords(collection, limit: 100),
+      ScrollAPI().listAdminCollectionChanges(collection, limit: 100),
+    ]);
+    if (!mounted || collection != _selectedCollection) return;
+    setState(() {
+      _records = results[0] is List ? results[0] as List : _records;
+      _collectionChanges = results[1] is List
+          ? results[1] as List
+          : _collectionChanges;
+    });
   }
 
   Future<void> _loadCollections() async {
@@ -8213,6 +8276,7 @@ class _CollectionBrowserState extends State<CollectionBrowser> {
         _selectedCollection = selected;
         _loading = false;
       });
+      _bindRealtime(selected);
       if (selected != null) await _loadCollection(selected);
     } catch (e) {
       if (!mounted) return;
@@ -8257,6 +8321,7 @@ class _CollectionBrowserState extends State<CollectionBrowser> {
       _selectedCollection = collection;
       _tab = 'Records';
     });
+    _bindRealtime(collection);
     await _loadCollection(collection);
   }
 
@@ -17104,6 +17169,7 @@ class _SettingsViewState extends State<SettingsView> {
   }
 
   Future<void> _disconnect() async {
+    ScrollRealtime().shutdown();
     await ScrollAPI().disconnect();
     ScrollData().clear();
     if (mounted) {

@@ -26,6 +26,21 @@ class ScrollAPI {
   /// Token for WebView JS injection only (dev helper — don't expose elsewhere)
   String get tokenForWebView => _token ?? '';
 
+  /// Websocket endpoint for realtime push (/ws), or null when not
+  /// connected. http(s) → ws(s), trailing slash trimmed.
+  String? get realtimeUrl {
+    final base = _objectServerUrl;
+    if (base == null || _token == null) return null;
+    final trimmed = base.endsWith('/')
+        ? base.substring(0, base.length - 1)
+        : base;
+    return '${trimmed.replaceFirst(RegExp(r'^http'), 'ws')}/ws';
+  }
+
+  /// Auth headers for the realtime websocket handshake.
+  Map<String, dynamic> get realtimeHeaders =>
+      _token == null ? const {} : {'Authorization': 'Bearer $_token'};
+
   /// Fires (once per connection) when the object server rejects the stored
   /// credential with a 401 — typically an expired session token. The shell
   /// listens and prompts the operator to sign in again.
