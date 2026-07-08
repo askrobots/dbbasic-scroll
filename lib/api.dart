@@ -639,6 +639,22 @@ No markdown, no backticks, no explanations. Only JSON.''';
     return result is Map<String, dynamic> ? result : null;
   }
 
+  // --- Theme / design system (/style is a themeable object) ---
+
+  /// GET /style?info=true (public) → {active, available, previews, tokens}.
+  /// `previews` maps each theme to a small swatch (bg/panel/accent/text).
+  Future<Map<String, dynamic>?> getStyleInfo() async {
+    final result = await _getRaw(_objUrl('style?info=true'));
+    return result is Map<String, dynamic> ? result : null;
+  }
+
+  /// POST /style {theme} — switch the whole instance's theme live.
+  /// Admin-gated server-side (the object self-gates on identity; non-admin
+  /// sessions get 403).
+  Future<Map<String, dynamic>> setStyleTheme(String theme) {
+    return rawRequest('POST', _objUrl('style'), data: {'theme': theme});
+  }
+
   Future<Map<String, dynamic>?> getAdminStatus() async {
     final result = await _getRaw(_objUrl('admin/status'));
     return result is Map<String, dynamic> ? result : null;

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
@@ -1192,11 +1193,231 @@ class _AppBar extends StatelessWidget {
               },
             ),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: 8),
+          // Notification bell — mirrors the web app-shell bell over the
+          // notifications collection.
+          const _NotificationBell(),
+          const SizedBox(width: 8),
           // Admin toggle
           _AdminToggle(active: adminMode, onTap: onAdminToggle),
         ],
       ),
+    );
+  }
+}
+
+/// App-bar notification bell reading the caller's `notifications` collection
+/// (per-user rows with is_read). Polls on a timer today; when the server
+/// ships websocket push it subscribes to the same stream instead.
+class _NotificationBell extends StatefulWidget {
+  const _NotificationBell();
+
+  @override
+  State<_NotificationBell> createState() => _NotificationBellState();
+}
+
+class _NotificationBellState extends State<_NotificationBell> {
+  List<Map<String, dynamic>> _notifications = [];
+  Timer? _poll;
+  bool _loading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+    _poll = Timer.periodic(const Duration(seconds: 45), (_) => _load());
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    if (_loading || !ScrollAPI().isConnected) return;
+    _loading = true;
+    final result = await ScrollAPI().listUserCollectionRecords(
+      'notifications',
+      limit: 50,
+    );
+    _loading = false;
+    if (!mounted) return;
+    final body = result['body'];
+    final rows = body is Map && body['records'] is List
+        ? body['records'] as List
+        : const [];
+    final parsed = [
+      for (final row in rows)
+        if (row is Map)
+          Map<String, dynamic>.from(
+            row.map((k, v) => MapEntry(k.toString(), v)),
+          ),
+    ]..sort((a, b) => '${b['created_at']}'.compareTo('${a['created_at']}'));
+    setState(() => _notifications = parsed);
+  }
+
+  int get _unread =>
+      _notifications.where((n) => !schemaBoolIsTrue(n['is_read'])).length;
+
+  String _text(Map<String, dynamic> n) {
+    for (final key in const ['message', 'title', 'body', 'text', 'summary']) {
+      final value = n[key];
+      if (value != null && value.toString().trim().isNotEmpty) {
+        return value.toString();
+      }
+    }
+    return n['id']?.toString() ?? 'notification';
+  }
+
+  Future<void> _markRead(Map<String, dynamic> n) async {
+    final id = n['id']?.toString();
+    if (id == null || id.isEmpty || schemaBoolIsTrue(n['is_read'])) return;
+    setState(() => n['is_read'] = 'true');
+    await ScrollAPI().putUserCollectionRecord('notifications', id, {
+      'is_read': 'true',
+    });
+  }
+
+  Future<void> _markAllRead() async {
+    final unread = _notifications
+        .where((n) => !schemaBoolIsTrue(n['is_read']))
+        .toList();
+    setState(() {
+      for (final n in unread) {
+        n['is_read'] = 'true';
+      }
+    });
+    for (final n in unread) {
+      final id = n['id']?.toString();
+      if (id != null && id.isNotEmpty) {
+        await ScrollAPI().putUserCollectionRecord('notifications', id, {
+          'is_read': 'true',
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final unread = _unread;
+    return PopupMenuButton<void>(
+      tooltip: 'Notifications',
+      offset: const Offset(0, 44),
+      constraints: const BoxConstraints(minWidth: 320, maxWidth: 380),
+      onOpened: _load,
+      icon: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          Icon(
+            unread > 0
+                ? Icons.notifications
+                : Icons.notifications_none_outlined,
+            size: 20,
+            color: unread > 0 ? Colors.amber : Colors.white54,
+          ),
+          if (unread > 0)
+            Positioned(
+              right: -4,
+              top: -4,
+              child: Container(
+                padding: const EdgeInsets.all(2),
+                constraints: const BoxConstraints(minWidth: 14, minHeight: 14),
+                decoration: BoxDecoration(
+                  color: Colors.red,
+                  borderRadius: BorderRadius.circular(7),
+                ),
+                child: Text(
+                  unread > 9 ? '9+' : '$unread',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 9,
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+      itemBuilder: (context) {
+        if (_notifications.isEmpty) {
+          return [
+            const PopupMenuItem<void>(
+              enabled: false,
+              child: Text(
+                'No notifications',
+                style: TextStyle(fontSize: 12, color: Colors.white38),
+              ),
+            ),
+          ];
+        }
+        return [
+          PopupMenuItem<void>(
+            enabled: false,
+            height: 32,
+            child: Row(
+              children: [
+                Text(
+                  'Notifications',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white54,
+                    letterSpacing: 1,
+                  ),
+                ),
+                const Spacer(),
+                if (unread > 0)
+                  InkWell(
+                    onTap: () {
+                      Navigator.of(context).pop();
+                      _markAllRead();
+                    },
+                    child: Text(
+                      'Mark all read',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: Theme.of(context).colorScheme.primary,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          for (final n in _notifications.take(15))
+            PopupMenuItem<void>(
+              onTap: () => _markRead(n),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: 7,
+                    height: 7,
+                    margin: const EdgeInsets.only(top: 5, right: 8),
+                    decoration: BoxDecoration(
+                      color: schemaBoolIsTrue(n['is_read'])
+                          ? Colors.transparent
+                          : Colors.amber,
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  Expanded(
+                    child: Text(
+                      _text(n),
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: schemaBoolIsTrue(n['is_read'])
+                            ? Colors.white54
+                            : Colors.white,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ];
+      },
     );
   }
 }
@@ -16737,11 +16958,18 @@ class _SettingsViewState extends State<SettingsView> {
   String? _serverKeyStatus;
   bool _serverKeyBusy = false;
 
+  String? _activeTheme;
+  List<String> _themes = [];
+  Map<String, Map<String, dynamic>> _themePreviews = {};
+  String? _themeStatus;
+  bool _themeBusy = false;
+
   @override
   void initState() {
     super.initState();
     _load();
     _loadServerKeys();
+    _loadThemes();
   }
 
   Future<void> _load() async {
@@ -16749,6 +16977,62 @@ class _SettingsViewState extends State<SettingsView> {
     if (mounted && key != null) {
       setState(() => _openaiController.text = key);
     }
+  }
+
+  Future<void> _loadThemes() async {
+    final info = await ScrollAPI().getStyleInfo();
+    if (!mounted || info == null) return;
+    final available = info['available'];
+    final previews = info['previews'];
+    setState(() {
+      _activeTheme = info['active']?.toString();
+      _themes = [
+        if (available is List)
+          for (final theme in available) theme.toString(),
+      ];
+      _themePreviews = {
+        if (previews is Map)
+          for (final entry in previews.entries)
+            if (entry.value is Map)
+              entry.key.toString(): Map<String, dynamic>.from(
+                (entry.value as Map).map((k, v) => MapEntry(k.toString(), v)),
+              ),
+      };
+    });
+  }
+
+  Future<void> _applyTheme(String theme) async {
+    if (_themeBusy || theme == _activeTheme) return;
+    setState(() {
+      _themeBusy = true;
+      _themeStatus = null;
+    });
+    final result = await ScrollAPI().setStyleTheme(theme);
+    if (!mounted) return;
+    final status = result['status'];
+    final ok = status is int && status >= 200 && status < 300;
+    setState(() {
+      _themeBusy = false;
+      if (ok) {
+        _activeTheme = theme;
+        _themeStatus = 'Instance theme is now "$theme"';
+      } else if (status == 403) {
+        _themeStatus = 'Switching the theme needs an admin session (got 403).';
+      } else {
+        _themeStatus = 'Failed: HTTP ${status ?? result['error'] ?? '?'}';
+      }
+    });
+  }
+
+  Color? _swatch(Map<String, dynamic>? preview, String key) {
+    final hex = preview?[key]?.toString();
+    if (hex == null || !hex.startsWith('#')) return null;
+    final cleaned = hex.substring(1);
+    final value = int.tryParse(
+      cleaned.length == 6 ? 'ff$cleaned' : cleaned,
+      radix: 16,
+    );
+    return value == null ? null : Color(value);
   }
 
   Future<void> _loadServerKeys() async {
@@ -17059,8 +17343,147 @@ class _SettingsViewState extends State<SettingsView> {
                     ),
                   ),
               ],
+
+              const SizedBox(height: 32),
+
+              // Instance theme — the server's design system is a themeable
+              // object (/style). Switching reskins every surface at once.
+              Text(
+                'INSTANCE THEME',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white38,
+                  letterSpacing: 1,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'The object server\'s theme is data served at /style — one '
+                'reversible edit reskins every web page and generated UI. '
+                'Switching needs an admin session.',
+                style: TextStyle(fontSize: 12, color: Colors.white54),
+              ),
+              const SizedBox(height: 12),
+              if (_themes.isEmpty)
+                Text(
+                  'No themes reported by /style?info=true.',
+                  style: TextStyle(fontSize: 12, color: Colors.white38),
+                )
+              else
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 12,
+                  children: [
+                    for (final theme in _themes) _themeCard(context, theme),
+                  ],
+                ),
+              if (_themeStatus != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Text(
+                    _themeStatus!,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color:
+                          _themeStatus!.startsWith('Failed') ||
+                              _themeStatus!.contains('403')
+                          ? Colors.red[300]
+                          : Colors.green,
+                    ),
+                  ),
+                ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  Widget _themeCard(BuildContext context, String theme) {
+    final preview = _themePreviews[theme];
+    final active = theme == _activeTheme;
+    final bg = _swatch(preview, 'bg') ?? Colors.black;
+    final panel = _swatch(preview, 'panel') ?? Colors.white10;
+    final accent = _swatch(preview, 'accent') ?? Colors.amber;
+    final text = _swatch(preview, 'text') ?? Colors.white;
+    return InkWell(
+      onTap: _themeBusy ? null : () => _applyTheme(theme),
+      borderRadius: BorderRadius.circular(10),
+      child: Container(
+        width: 150,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: active
+                ? Theme.of(context).colorScheme.primary
+                : Colors.white12,
+            width: active ? 2 : 1,
+          ),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Swatch preview built from the theme's own tokens.
+            Container(
+              height: 56,
+              color: bg,
+              padding: const EdgeInsets.all(10),
+              child: Row(
+                children: [
+                  Container(
+                    width: 40,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: panel,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Aa',
+                        style: TextStyle(
+                          color: text,
+                          fontSize: 14,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Container(
+                        width: 32,
+                        height: 6,
+                        decoration: BoxDecoration(
+                          color: accent,
+                          borderRadius: BorderRadius.circular(3),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              color: Theme.of(context).colorScheme.surfaceContainerLow,
+              child: Row(
+                children: [
+                  Text(theme, style: const TextStyle(fontSize: 13)),
+                  const Spacer(),
+                  if (active)
+                    Icon(
+                      Icons.check_circle,
+                      size: 16,
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+                ],
+              ),
+            ),
+          ],
         ),
       ),
     );
