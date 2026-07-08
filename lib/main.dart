@@ -12037,6 +12037,9 @@ class PackageManagerView extends StatefulWidget {
 class _PackageManagerViewState extends State<PackageManagerView> {
   final _searchController = TextEditingController();
   bool _refreshing = false;
+  final Set<String> _expanded = {};
+  final Set<String> _loadingProv = {};
+  final Map<String, Map<String, dynamic>> _provenance = {};
 
   @override
   void dispose() {
@@ -12045,9 +12048,30 @@ class _PackageManagerViewState extends State<PackageManagerView> {
   }
 
   Future<void> _refresh() async {
-    setState(() => _refreshing = true);
+    setState(() {
+      _refreshing = true;
+      _provenance.clear();
+    });
     await ScrollData().loadAll();
     if (mounted) setState(() => _refreshing = false);
+  }
+
+  /// Lazily fetch a package's provenance (GET /packages/{id}) on first
+  /// expand — the /admin/status list doesn't carry per-artifact baselines.
+  Future<void> _toggleProvenance(String id) async {
+    if (_expanded.contains(id)) {
+      setState(() => _expanded.remove(id));
+      return;
+    }
+    setState(() => _expanded.add(id));
+    if (_provenance.containsKey(id) || _loadingProv.contains(id)) return;
+    setState(() => _loadingProv.add(id));
+    final result = await ScrollAPI().getPackage(id);
+    if (!mounted) return;
+    setState(() {
+      _loadingProv.remove(id);
+      if (result != null) _provenance[id] = result;
+    });
   }
 
   @override
@@ -12129,8 +12153,10 @@ class _PackageManagerViewState extends State<PackageManagerView> {
                     itemBuilder: (context, i) {
                       final p = packages[i];
                       final color = _statusColor(p.status);
+                      final expanded = _expanded.contains(p.name);
+                      final loadingProv = _loadingProv.contains(p.name);
+                      final prov = _provenance[p.name];
                       return Container(
-                        padding: const EdgeInsets.all(14),
                         decoration: BoxDecoration(
                           color: Theme.of(
                             context,
@@ -12138,92 +12164,152 @@ class _PackageManagerViewState extends State<PackageManagerView> {
                           borderRadius: BorderRadius.circular(8),
                           border: Border.all(color: Colors.white10),
                         ),
-                        child: Row(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            Container(
-                              width: 38,
-                              height: 38,
-                              decoration: BoxDecoration(
-                                color: color.withValues(alpha: 0.14),
-                                shape: BoxShape.circle,
-                              ),
-                              child: Icon(
-                                p.installed
-                                    ? Icons.check
-                                    : Icons.extension_outlined,
-                                size: 20,
-                                color: color,
-                              ),
-                            ),
-                            const SizedBox(width: 14),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Row(
-                                    children: [
-                                      Flexible(
-                                        child: Text(
-                                          p.displayName,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: const TextStyle(
-                                            fontSize: 15,
-                                            fontWeight: FontWeight.w600,
-                                          ),
-                                        ),
+                            InkWell(
+                              onTap: p.installed
+                                  ? () => _toggleProvenance(p.name)
+                                  : null,
+                              borderRadius: BorderRadius.circular(8),
+                              child: Padding(
+                                padding: const EdgeInsets.all(14),
+                                child: Row(
+                                  children: [
+                                    Container(
+                                      width: 38,
+                                      height: 38,
+                                      decoration: BoxDecoration(
+                                        color: color.withValues(alpha: 0.14),
+                                        shape: BoxShape.circle,
                                       ),
-                                      if (p.version.isNotEmpty) ...[
-                                        const SizedBox(width: 8),
-                                        Text(
-                                          'v${p.version}',
-                                          style: TextStyle(
-                                            fontSize: 11,
-                                            color: Colors.white38,
-                                          ),
-                                        ),
-                                      ],
-                                      const SizedBox(width: 8),
-                                      _packageChip(p.source, Colors.blue),
-                                    ],
-                                  ),
-                                  const SizedBox(height: 3),
-                                  Text(
-                                    p.description,
-                                    maxLines: 2,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      color: Colors.white54,
+                                      child: Icon(
+                                        p.installed
+                                            ? Icons.check
+                                            : Icons.extension_outlined,
+                                        size: 20,
+                                        color: color,
+                                      ),
                                     ),
-                                  ),
-                                ],
+                                    const SizedBox(width: 14),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Row(
+                                            children: [
+                                              Flexible(
+                                                child: Text(
+                                                  p.displayName,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: const TextStyle(
+                                                    fontSize: 15,
+                                                    fontWeight: FontWeight.w600,
+                                                  ),
+                                                ),
+                                              ),
+                                              if (p.version.isNotEmpty) ...[
+                                                const SizedBox(width: 8),
+                                                Text(
+                                                  'v${p.version}',
+                                                  style: TextStyle(
+                                                    fontSize: 11,
+                                                    color: Colors.white38,
+                                                  ),
+                                                ),
+                                              ],
+                                              const SizedBox(width: 8),
+                                              _packageChip(
+                                                p.source,
+                                                Colors.blue,
+                                              ),
+                                            ],
+                                          ),
+                                          const SizedBox(height: 3),
+                                          Text(
+                                            p.description,
+                                            maxLines: 2,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(
+                                              fontSize: 12,
+                                              color: Colors.white54,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                    const SizedBox(width: 16),
+                                    Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.end,
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        _packageChip(p.statusLabel, color),
+                                        const SizedBox(height: 8),
+                                        if (p.installed)
+                                          Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Text(
+                                                'Provenance',
+                                                style: TextStyle(
+                                                  fontSize: 11,
+                                                  color: Colors.white38,
+                                                ),
+                                              ),
+                                              Icon(
+                                                expanded
+                                                    ? Icons.expand_less
+                                                    : Icons.expand_more,
+                                                size: 18,
+                                                color: Colors.white38,
+                                              ),
+                                            ],
+                                          )
+                                        else
+                                          Tooltip(
+                                            message:
+                                                'Package installs are disabled on public staging',
+                                            child: OutlinedButton.icon(
+                                              onPressed: null,
+                                              icon: const Icon(
+                                                Icons.lock,
+                                                size: 14,
+                                              ),
+                                              label: const Text(
+                                                'Install locked',
+                                              ),
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
                               ),
                             ),
-                            const SizedBox(width: 16),
-                            Column(
-                              crossAxisAlignment: CrossAxisAlignment.end,
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                _packageChip(p.statusLabel, color),
-                                const SizedBox(height: 8),
-                                if (p.installed)
-                                  OutlinedButton.icon(
-                                    onPressed: null,
-                                    icon: const Icon(Icons.check, size: 14),
-                                    label: const Text('Installed'),
-                                  )
-                                else
-                                  Tooltip(
-                                    message:
-                                        'Package installs are disabled on public staging',
-                                    child: OutlinedButton.icon(
-                                      onPressed: null,
-                                      icon: const Icon(Icons.lock, size: 14),
-                                      label: const Text('Install locked'),
-                                    ),
-                                  ),
-                              ],
-                            ),
+                            if (expanded)
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(
+                                  14,
+                                  0,
+                                  14,
+                                  14,
+                                ),
+                                child: loadingProv
+                                    ? const Padding(
+                                        padding: EdgeInsets.all(8),
+                                        child: SizedBox(
+                                          width: 16,
+                                          height: 16,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                          ),
+                                        ),
+                                      )
+                                    : _provenancePanel(context, prov),
+                              ),
                           ],
                         ),
                       );
@@ -12290,6 +12376,95 @@ class _PackageManagerViewState extends State<PackageManagerView> {
           color: color,
           fontWeight: FontWeight.bold,
         ),
+      ),
+    );
+  }
+
+  /// Renders the provenance block from GET /packages/{id}: whether the
+  /// package diverges from its shipped baseline, and each artifact's state.
+  Widget _provenancePanel(BuildContext context, Map<String, dynamic>? pkg) {
+    final prov = pkg?['provenance'];
+    if (prov is! Map) {
+      return Text(
+        'Provenance unavailable for this session.',
+        style: TextStyle(fontSize: 12, color: Colors.white38),
+      );
+    }
+    final installed = prov['installed'] == true;
+    final customized = prov['customized'] == true;
+    final installedVersion = prov['installed_version']?.toString();
+    final artifacts = prov['artifacts'];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Divider(height: 1, color: Colors.white10),
+        const SizedBox(height: 10),
+        Wrap(
+          spacing: 8,
+          runSpacing: 6,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            if (!installed)
+              _packageChip('NO BASELINE', Colors.white54)
+            else
+              _packageChip(
+                customized ? 'CUSTOMIZED' : 'PRISTINE',
+                customized ? Colors.orange : Colors.green,
+              ),
+            if (installedVersion != null && installedVersion.isNotEmpty)
+              Text(
+                'baseline v$installedVersion',
+                style: TextStyle(fontSize: 11, color: Colors.white38),
+              ),
+            if (installed && customized)
+              Text(
+                'diverges from the shipped version',
+                style: TextStyle(fontSize: 11, color: Colors.orange[200]),
+              ),
+          ],
+        ),
+        if (artifacts is List && artifacts.isNotEmpty) ...[
+          const SizedBox(height: 10),
+          for (final artifact in artifacts)
+            if (artifact is Map) _artifactRow(artifact),
+        ],
+      ],
+    );
+  }
+
+  Widget _artifactRow(Map artifact) {
+    final kind = artifact['kind']?.toString() ?? 'artifact';
+    final name =
+        (artifact['id'] ?? artifact['collection'] ?? artifact['name'] ?? '?')
+            .toString();
+    final state = artifact['state']?.toString() ?? 'unknown';
+    final color = switch (state) {
+      'pristine' => Colors.green,
+      'customized' => Colors.orange,
+      'removed' => Colors.red,
+      _ => Colors.white54,
+    };
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 5),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 68,
+            child: Text(
+              kind,
+              style: TextStyle(fontSize: 11, color: Colors.white38),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              name,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+            ),
+          ),
+          const SizedBox(width: 8),
+          _packageChip(state.toUpperCase(), color),
+        ],
       ),
     );
   }

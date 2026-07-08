@@ -675,6 +675,15 @@ No markdown, no backticks, no explanations. Only JSON.''';
     return result is Map<String, dynamic> ? result : null;
   }
 
+  /// GET /packages/{id} (admin-gated) → {status, package, provenance}.
+  /// The provenance block reports install-once baseline state: whether the
+  /// package is installed, at what version, and per-artifact pristine/
+  /// customized/removed vs the shipped baseline.
+  Future<Map<String, dynamic>?> getPackage(String id) async {
+    final result = await _getRaw(_objUrl('packages/${_pathSegment(id)}'));
+    return result is Map<String, dynamic> ? result : null;
+  }
+
   // --- Backups (admin-gated; a backup contains ALL data, never public) ---
 
   /// GET /admin/backups → {backups: [{id, created_at, size, kind, scope}],
