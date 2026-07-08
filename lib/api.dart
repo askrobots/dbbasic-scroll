@@ -684,6 +684,46 @@ No markdown, no backticks, no explanations. Only JSON.''';
     return result is Map<String, dynamic> ? result : null;
   }
 
+  /// In-place package upgrade: POST /packages/{id}/install {allow_replace:true}.
+  /// Objects/schema/permissions update, records preserved, conflicts parked
+  /// as pending-reconcile records rather than overwritten.
+  Future<Map<String, dynamic>> installPackage(
+    String id, {
+    bool allowReplace = true,
+  }) {
+    return rawRequest(
+      'POST',
+      _objUrl('packages/${_pathSegment(id)}/install'),
+      data: {'allow_replace': allowReplace},
+    );
+  }
+
+  // --- Reconcile inbox (parked upgrade conflicts) ---
+
+  /// GET /admin/reconciles → {status, count, reconciles:[...]}.
+  Future<Map<String, dynamic>> listReconciles({
+    String? status,
+    String? package,
+  }) {
+    final params = <String>[
+      if (status != null && status.isNotEmpty)
+        'status=${Uri.encodeQueryComponent(status)}',
+      if (package != null && package.isNotEmpty)
+        'package=${Uri.encodeQueryComponent(package)}',
+    ];
+    final query = params.isEmpty ? '' : '?${params.join('&')}';
+    return rawRequest('GET', _objUrl('admin/reconciles$query'));
+  }
+
+  /// POST /admin/reconciles/{id}/resolve {choice: keep_mine|take_theirs}.
+  Future<Map<String, dynamic>> resolveReconcile(String id, String choice) {
+    return rawRequest(
+      'POST',
+      _objUrl('admin/reconciles/${_pathSegment(id)}/resolve'),
+      data: {'choice': choice},
+    );
+  }
+
   // --- Backups (admin-gated; a backup contains ALL data, never public) ---
 
   /// GET /admin/backups → {backups: [{id, created_at, size, kind, scope}],

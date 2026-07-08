@@ -12040,6 +12040,13 @@ class _PackageManagerViewState extends State<PackageManagerView> {
   final Set<String> _expanded = {};
   final Set<String> _loadingProv = {};
   final Map<String, Map<String, dynamic>> _provenance = {};
+  List<Map<String, dynamic>> _reconciles = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadReconciles();
+  }
 
   @override
   void dispose() {
@@ -12053,7 +12060,194 @@ class _PackageManagerViewState extends State<PackageManagerView> {
       _provenance.clear();
     });
     await ScrollData().loadAll();
+    await _loadReconciles();
     if (mounted) setState(() => _refreshing = false);
+  }
+
+  /// Parked upgrade conflicts — a customization whose upstream also changed.
+  Future<void> _loadReconciles() async {
+    final result = await ScrollAPI().listReconciles(status: 'pending');
+    if (!mounted) return;
+    final body = result['body'];
+    final raw = body is Map ? body['reconciles'] : null;
+    setState(() {
+      _reconciles = [
+        if (raw is List)
+          for (final r in raw)
+            if (r is Map)
+              Map<String, dynamic>.from(
+                r.map((k, v) => MapEntry(k.toString(), v)),
+              ),
+      ];
+    });
+  }
+
+  int _conflictsFor(String package) =>
+      _reconciles.where((r) => r['package'] == package).length;
+
+  Future<void> _resolve(Map<String, dynamic> reconcile, String choice) async {
+    final id = reconcile['id']?.toString();
+    if (id == null) return;
+    final result = await ScrollAPI().resolveReconcile(id, choice);
+    final code = result['status'];
+    final ok = code is int && code >= 200 && code < 300;
+    if (!mounted) return;
+    if (ok) {
+      // Drop it locally and clear cached provenance so the badge updates.
+      setState(() => _reconciles.removeWhere((r) => r['id'] == id));
+      _provenance.remove(reconcile['package']?.toString());
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            choice == 'take_theirs'
+                ? 'Took the shipped version.'
+                : 'Kept your version.',
+          ),
+          backgroundColor: Colors.green[800],
+        ),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Resolve failed: HTTP ${code ?? result['error']}'),
+          backgroundColor: Colors.red[800],
+        ),
+      );
+    }
+  }
+
+  /// LCS unified line diff of live ("mine") vs shipped ("theirs").
+  List<(String, String)> _unifiedDiff(String mine, String theirs) {
+    final a = mine.split('\n');
+    final b = theirs.split('\n');
+    final n = a.length, m = b.length;
+    // Guard against pathologically large sources (O(n*m) table).
+    if (n > 1500 || m > 1500) {
+      return [
+        for (final line in a) ('remove', line),
+        for (final line in b) ('add', line),
+      ];
+    }
+    final dp = List.generate(n + 1, (_) => List<int>.filled(m + 1, 0));
+    for (var i = n - 1; i >= 0; i--) {
+      for (var j = m - 1; j >= 0; j--) {
+        dp[i][j] = a[i] == b[j]
+            ? dp[i + 1][j + 1] + 1
+            : (dp[i + 1][j] >= dp[i][j + 1] ? dp[i + 1][j] : dp[i][j + 1]);
+      }
+    }
+    final out = <(String, String)>[];
+    var i = 0, j = 0;
+    while (i < n && j < m) {
+      if (a[i] == b[j]) {
+        out.add(('same', a[i]));
+        i++;
+        j++;
+      } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+        out.add(('remove', a[i]));
+        i++;
+      } else {
+        out.add(('add', b[j]));
+        j++;
+      }
+    }
+    while (i < n) {
+      out.add(('remove', a[i++]));
+    }
+    while (j < m) {
+      out.add(('add', b[j++]));
+    }
+    return out;
+  }
+
+  void _showReconcileDialog(Map<String, dynamic> reconcile) {
+    final artifact = reconcile['artifact'];
+    final artifactLabel = artifact is Map
+        ? '${artifact['kind']}: ${artifact['id'] ?? artifact['collection'] ?? ''}'
+        : 'artifact';
+    final mine = reconcile['mine']?.toString() ?? '';
+    final theirs = reconcile['theirs']?.toString() ?? '';
+    final diff = _unifiedDiff(mine, theirs);
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('${reconcile['package']} — $artifactLabel'),
+        content: SizedBox(
+          width: 640,
+          height: 460,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Your version (v${reconcile['baseline_version'] ?? '?'}) '
+                'vs shipped (v${reconcile['target_version'] ?? '?'}). '
+                '− red is yours (keep mine), + green is shipped (take theirs).',
+                style: TextStyle(fontSize: 12, color: Colors.white54),
+              ),
+              const SizedBox(height: 10),
+              Expanded(
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Colors.black26,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.white10),
+                  ),
+                  child: SingleChildScrollView(
+                    child: SelectableText.rich(
+                      TextSpan(
+                        children: [
+                          for (final (type, line) in diff)
+                            TextSpan(
+                              text:
+                                  '${switch (type) {
+                                    'add' => '+',
+                                    'remove' => '-',
+                                    _ => ' ',
+                                  }} $line\n',
+                              style: TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 11.5,
+                                height: 1.4,
+                                color: switch (type) {
+                                  'add' => Colors.green[300],
+                                  'remove' => Colors.red[300],
+                                  _ => Colors.white38,
+                                },
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Cancel'),
+          ),
+          OutlinedButton(
+            onPressed: () {
+              Navigator.of(dialogContext).pop();
+              _resolve(reconcile, 'keep_mine');
+            },
+            child: const Text('Keep Mine'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.of(dialogContext).pop();
+              _resolve(reconcile, 'take_theirs');
+            },
+            child: const Text('Take Theirs'),
+          ),
+        ],
+      ),
+    );
   }
 
   /// Lazily fetch a package's provenance (GET /packages/{id}) on first
@@ -12143,6 +12337,10 @@ class _PackageManagerViewState extends State<PackageManagerView> {
                 : 'Package status is unavailable until /admin/status returns an authenticated response.',
             style: TextStyle(fontSize: 12, color: Colors.white38),
           ),
+          if (_reconciles.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            _conflictsBanner(context),
+          ],
           const SizedBox(height: 16),
           Expanded(
             child: packages.isEmpty
@@ -12225,6 +12423,16 @@ class _PackageManagerViewState extends State<PackageManagerView> {
                                                 p.source,
                                                 Colors.blue,
                                               ),
+                                              if (_conflictsFor(p.name) >
+                                                  0) ...[
+                                                const SizedBox(width: 8),
+                                                _packageChip(
+                                                  '${_conflictsFor(p.name)} '
+                                                  'conflict'
+                                                  '${_conflictsFor(p.name) == 1 ? '' : 's'}',
+                                                  Colors.orange,
+                                                ),
+                                              ],
                                             ],
                                           ),
                                           const SizedBox(height: 3),
@@ -12376,6 +12584,86 @@ class _PackageManagerViewState extends State<PackageManagerView> {
           color: color,
           fontWeight: FontWeight.bold,
         ),
+      ),
+    );
+  }
+
+  /// Parked upgrade conflicts across all packages — each opens a mine-vs-
+  /// theirs diff with keep-mine / take-theirs.
+  Widget _conflictsBanner(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.orange.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.orange.withValues(alpha: 0.3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.merge_type, size: 18, color: Colors.orange[300]),
+              const SizedBox(width: 8),
+              Text(
+                '${_reconciles.length} pending '
+                'conflict${_reconciles.length == 1 ? '' : 's'}',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.orange[200],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'An upgrade changed something you had customized — your '
+                  'version is preserved until you resolve it.',
+                  style: TextStyle(fontSize: 12, color: Colors.white54),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          for (final reconcile in _reconciles)
+            _conflictCard(context, reconcile),
+        ],
+      ),
+    );
+  }
+
+  Widget _conflictCard(BuildContext context, Map<String, dynamic> reconcile) {
+    final artifact = reconcile['artifact'];
+    final artifactLabel = artifact is Map
+        ? '${artifact['kind']}: ${artifact['id'] ?? artifact['collection'] ?? ''}'
+        : 'artifact';
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        children: [
+          _packageChip(reconcile['package']?.toString() ?? '?', Colors.orange),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              artifactLabel,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            'v${reconcile['baseline_version'] ?? '?'} → '
+            'v${reconcile['target_version'] ?? '?'}',
+            style: TextStyle(fontSize: 11, color: Colors.white38),
+          ),
+          const SizedBox(width: 10),
+          FilledButton.tonal(
+            onPressed: () => _showReconcileDialog(reconcile),
+            style: FilledButton.styleFrom(visualDensity: VisualDensity.compact),
+            child: const Text('Review'),
+          ),
+        ],
       ),
     );
   }
