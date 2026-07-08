@@ -698,7 +698,9 @@ No markdown, no backticks, no explanations. Only JSON.''';
       _objUrl('admin/backups/${_pathSegment(id)}/download'),
     );
     try {
-      final response = await _client.get(uri, headers: _headers());
+      final response = await _client
+          .get(uri, headers: _headers())
+          .timeout(const Duration(seconds: 90));
       _noteAuthResult(response.statusCode, _AuthMode.objectServer);
       if (response.statusCode >= 200 && response.statusCode < 300) {
         var filename = 'backup-$id.tar.gz';

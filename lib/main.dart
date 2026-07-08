@@ -19811,7 +19811,6 @@ class _BackupViewState extends State<BackupView> {
   bool _loading = true;
   bool _creating = false;
   String? _downloadingId;
-  String? _error;
   String? _status;
   bool _statusIsError = false;
 
@@ -19822,10 +19821,7 @@ class _BackupViewState extends State<BackupView> {
   }
 
   Future<void> _refresh() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+    setState(() => _loading = true);
     // Refresh capabilities (the flags may predate the backup-API deploy)
     // and the inventory together.
     final status = await ScrollAPI().getAdminStatus();
@@ -19848,12 +19844,9 @@ class _BackupViewState extends State<BackupView> {
         _loading = false;
       });
     } else {
-      setState(() {
-        _loading = false;
-        // 404/401 here just means the capability isn't live for this
-        // session; the locked placeholder covers it.
-        _error = code is int && code != 200 ? 'HTTP $code' : null;
-      });
+      // A non-2xx here just means the capability isn't live for this
+      // session; the locked/empty placeholder covers it.
+      setState(() => _loading = false);
     }
   }
 
@@ -19879,6 +19872,23 @@ class _BackupViewState extends State<BackupView> {
   Future<void> _download(Map<String, dynamic> backup) async {
     final id = backup['id']?.toString();
     if (id == null || id.isEmpty) return;
+    // Ask where to save FIRST (instant native dialog) — the row id is the
+    // archive filename. Fetch bytes only if the user commits to a location.
+    final suggested = id.endsWith('.tar.gz') ? id : '$id.tar.gz';
+    FileSaveLocation? location;
+    try {
+      location = await getSaveLocation(suggestedName: suggested);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _statusIsError = true;
+          _status = 'Could not open the save dialog: $e';
+        });
+      }
+      return;
+    }
+    if (location == null) return; // cancelled
+    final target = location.path;
     setState(() {
       _downloadingId = id;
       _status = null;
@@ -19893,22 +19903,13 @@ class _BackupViewState extends State<BackupView> {
       });
       return;
     }
-    // Native Save dialog — sandbox-safe: the user's choice grants write
-    // access to that location.
     try {
-      final location = await getSaveLocation(suggestedName: result.filename);
-      if (location == null) {
-        if (mounted) setState(() => _downloadingId = null);
-        return; // cancelled
-      }
-      await File(location.path).writeAsBytes(result.bytes);
+      await File(target).writeAsBytes(result.bytes);
       if (!mounted) return;
       setState(() {
         _downloadingId = null;
         _statusIsError = false;
-        _status =
-            'Saved ${_formatSize(result.bytes.length)} to '
-            '${location.path}';
+        _status = 'Saved ${_formatSize(result.bytes.length)} to $target';
       });
     } catch (e) {
       if (!mounted) return;
@@ -20316,5 +20317,4 @@ class _BackupViewState extends State<BackupView> {
       ),
     );
   }
-
 }
