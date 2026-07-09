@@ -8,6 +8,12 @@ import 'data.dart';
 import 'realtime.dart';
 import 'schema_form.dart';
 
+/// Record keys that are internal plumbing, never shown as a data column:
+/// the id, the owner pointer, and the `extra` overflow blob (a JSON string
+/// holding collision-proof user data — its declared fields surface at top
+/// level, so the raw key itself is noise).
+const _internalRecordKeys = {'id', 'record_id', 'owner_id', 'extra'};
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const ScrollApp());
@@ -9584,7 +9590,7 @@ class _CollectionBrowserState extends State<CollectionBrowser> {
       if (parts.isNotEmpty) return parts.join('  ');
     }
     for (final entry in record.entries) {
-      if (entry.key == 'id' || entry.key == 'record_id') continue;
+      if (_internalRecordKeys.contains(entry.key)) continue;
       if (!_hasValue(entry.value)) continue;
       parts.add('${_titleCase(entry.key)}: ${_valueText(entry.value)}');
       if (parts.length == 2) break;
@@ -12325,6 +12331,10 @@ class _PackageManagerViewState extends State<PackageManagerView> {
     final mine = reconcile['mine']?.toString() ?? '';
     final theirs = reconcile['theirs']?.toString() ?? '';
     final diff = _unifiedDiff(mine, theirs);
+    // Phase 4a: schema conflicts name the exact clashing fields.
+    final collisions = reconcile['collisions'] is List
+        ? (reconcile['collisions'] as List).map((c) => c.toString()).toList()
+        : const <String>[];
     showDialog<void>(
       context: context,
       builder: (dialogContext) => AlertDialog(
@@ -12341,6 +12351,26 @@ class _PackageManagerViewState extends State<PackageManagerView> {
                 '− red is yours (keep mine), + green is shipped (take theirs).',
                 style: TextStyle(fontSize: 12, color: Colors.white54),
               ),
+              if (collisions.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      Text(
+                        'Conflicting fields:',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Colors.orange[200],
+                        ),
+                      ),
+                      for (final field in collisions)
+                        _packageChip(field, Colors.orange),
+                    ],
+                  ),
+                ),
               const SizedBox(height: 10),
               Expanded(
                 child: Container(
@@ -15137,7 +15167,7 @@ class _GlobalSearchViewState extends State<GlobalSearchView> {
     if (listFields.isNotEmpty) return listFields;
     return [
       for (final key in record.keys)
-        if (key != 'id') key,
+        if (!_internalRecordKeys.contains(key)) key,
     ].take(4).toList();
   }
 
