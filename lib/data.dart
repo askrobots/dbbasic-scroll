@@ -269,6 +269,16 @@ class ScrollData {
     ], root: adminStatus);
   }
 
+  Map<String, dynamic> get packagesCapability {
+    return _mapAt(const [
+      ['capabilities', 'packages'],
+      ['packages'],
+    ], root: adminStatus);
+  }
+
+  bool get packagesCanInstall =>
+      _boolFromDynamic(packagesCapability['can_install']) == true;
+
   int? get maxObjectFileBytes {
     final value =
         fileWritesCapability['max_bytes'] ??

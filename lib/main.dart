@@ -12085,6 +12085,163 @@ class _PackageManagerViewState extends State<PackageManagerView> {
   int _conflictsFor(String package) =>
       _reconciles.where((r) => r['package'] == package).length;
 
+  final Set<String> _installing = {};
+
+  Future<void> _upgrade(_PackageStatus p) async {
+    final isUpgrade = p.installed;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('${isUpgrade ? 'Upgrade' : 'Install'} ${p.displayName}?'),
+        content: Text(
+          isUpgrade
+              ? 'Objects, schema, and permissions update to the shipped '
+                    'version. Your records are preserved, and anything you '
+                    'customized that also changed upstream is parked as a '
+                    'conflict rather than overwritten.'
+              : 'Installs ${p.displayName} with its objects, schema, '
+                    'permissions, and seed data.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(isUpgrade ? 'Upgrade' : 'Install'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    setState(() => _installing.add(p.name));
+    final result = await ScrollAPI().installPackage(p.name);
+    if (!mounted) return;
+    setState(() => _installing.remove(p.name));
+    final code = result['status'];
+    final ok = code is int && code >= 200 && code < 300;
+    // Refresh regardless so provenance + any parked conflicts reflect reality.
+    _provenance.remove(p.name);
+    await ScrollData().loadAll();
+    await _loadReconciles();
+    if (!mounted) return;
+    setState(() {});
+    if (ok) {
+      _showInstallResult(p, result['body']);
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '${isUpgrade ? 'Upgrade' : 'Install'} failed: '
+            'HTTP ${code ?? result['error']}',
+          ),
+          backgroundColor: Colors.red[800],
+        ),
+      );
+    }
+  }
+
+  /// Flatten the per-artifact install result into (label, status) rows from
+  /// whatever shape the server returns.
+  List<(String, String)> _installArtifacts(dynamic body) {
+    final root = body is Map ? (body['install'] ?? body['result'] ?? body) : {};
+    final rows = <(String, String)>[];
+    void collect(dynamic list, String kind) {
+      if (list is! List) return;
+      for (final item in list) {
+        if (item is Map) {
+          final name =
+              (item['id'] ?? item['collection'] ?? item['name'] ?? kind)
+                  .toString();
+          final status = (item['status'] ?? item['state'] ?? '?').toString();
+          rows.add(('$kind: $name', status));
+        }
+      }
+    }
+
+    if (root is Map) {
+      collect(root['objects'], 'object');
+      collect(root['schemas'], 'schema');
+      collect(root['artifacts'], 'artifact');
+    }
+    return rows;
+  }
+
+  void _showInstallResult(_PackageStatus p, dynamic body) {
+    final artifacts = _installArtifacts(body);
+    final reconciles = _conflictsFor(p.name);
+    Color statusColor(String s) => switch (s) {
+      'written' || 'updated' => Colors.green,
+      'kept' => Colors.blue,
+      'unchanged' => Colors.white54,
+      'conflict' => Colors.orange,
+      _ => Colors.white54,
+    };
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('${p.displayName} upgraded'),
+        content: SizedBox(
+          width: 460,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (reconciles > 0)
+                Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.only(bottom: 12),
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Colors.orange.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    '$reconciles conflict${reconciles == 1 ? '' : 's'} '
+                    'parked — your customizations are safe. Resolve them in '
+                    'the conflicts banner on the Package Manager.',
+                    style: TextStyle(fontSize: 12, color: Colors.orange[200]),
+                  ),
+                ),
+              if (artifacts.isEmpty)
+                Text(
+                  'Upgrade completed. Records preserved.',
+                  style: TextStyle(fontSize: 13, color: Colors.white70),
+                )
+              else
+                for (final (label, status) in artifacts)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 5),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            label,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 12,
+                              fontFamily: 'monospace',
+                            ),
+                          ),
+                        ),
+                        _packageChip(status.toUpperCase(), statusColor(status)),
+                      ],
+                    ),
+                  ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _resolve(Map<String, dynamic> reconcile, String choice) async {
     final id = reconcile['id']?.toString();
     if (id == null) return;
@@ -12460,6 +12617,10 @@ class _PackageManagerViewState extends State<PackageManagerView> {
                                           Row(
                                             mainAxisSize: MainAxisSize.min,
                                             children: [
+                                              if (data.packagesCanInstall) ...[
+                                                _upgradeButton(p, 'Upgrade'),
+                                                const SizedBox(width: 8),
+                                              ],
                                               Text(
                                                 'Provenance',
                                                 style: TextStyle(
@@ -12476,10 +12637,12 @@ class _PackageManagerViewState extends State<PackageManagerView> {
                                               ),
                                             ],
                                           )
+                                        else if (data.packagesCanInstall)
+                                          _upgradeButton(p, 'Install')
                                         else
                                           Tooltip(
                                             message:
-                                                'Package installs are disabled on public staging',
+                                                'Package installs are disabled on this server',
                                             child: OutlinedButton.icon(
                                               onPressed: null,
                                               icon: const Icon(
@@ -12565,6 +12728,22 @@ class _PackageManagerViewState extends State<PackageManagerView> {
           ],
         ),
       ),
+    );
+  }
+
+  Widget _upgradeButton(_PackageStatus p, String label) {
+    final busy = _installing.contains(p.name);
+    return OutlinedButton.icon(
+      onPressed: busy ? null : () => _upgrade(p),
+      icon: busy
+          ? const SizedBox(
+              width: 13,
+              height: 13,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          : Icon(label == 'Upgrade' ? Icons.upgrade : Icons.download, size: 14),
+      label: Text(label == 'Upgrade' ? 'Upgrade (keep data)' : label),
+      style: OutlinedButton.styleFrom(visualDensity: VisualDensity.compact),
     );
   }
 
@@ -12725,9 +12904,15 @@ class _PackageManagerViewState extends State<PackageManagerView> {
     final name =
         (artifact['id'] ?? artifact['collection'] ?? artifact['name'] ?? '?')
             .toString();
-    final state = artifact['state']?.toString() ?? 'unknown';
+    // Phase 3: an overridden object is customized safely (upgrade-proof),
+    // so it reads as its own good state rather than "customized".
+    final overridden = artifact['overridden'] == true;
+    final state = overridden
+        ? 'overridden'
+        : (artifact['state']?.toString() ?? 'unknown');
     final color = switch (state) {
       'pristine' => Colors.green,
+      'overridden' => Colors.teal,
       'customized' => Colors.orange,
       'removed' => Colors.red,
       _ => Colors.white54,
