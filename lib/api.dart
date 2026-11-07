@@ -1764,6 +1764,9 @@ No markdown, no backticks, no explanations. Only JSON.''';
     return _putRaw(_objUrl('admin/objects/$id?source=true'), {'code': code});
   }
 
+  /// CAUTION: on the server, DELETE /objects/{id} RUNS the object's DELETE
+  /// handler; it does not remove the object (there is no object-delete
+  /// route as of 6707021). Unused; don't wire a "delete object" button to it.
   Future<bool> deleteObject(String objectId) async {
     return _deleteRaw(_objUrl('objects/$objectId'));
   }

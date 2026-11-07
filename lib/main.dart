@@ -6810,6 +6810,7 @@ class ObjectWorkspace extends StatefulWidget {
 
 class _ObjectWorkspaceState extends State<ObjectWorkspace> {
   String? _selectedObject;
+  String _objectQuery = '';
   String _tab = 'Overview';
   Map<String, List<Map<String, dynamic>>> _objects = {};
   bool _loading = true;
@@ -6922,6 +6923,8 @@ class _ObjectWorkspaceState extends State<ObjectWorkspace> {
           break;
         case 'Versions':
           _versionsData = await api.getAdminObjectVersions(_selectedObject!);
+          // The "installed" row (no saved versions) is built from metadata.
+          _metadataData ??= await api.getAdminObjectMetadata(_selectedObject!);
           break;
         case 'Activity':
           _changesData = await api.getAdminObjectChanges(_selectedObject!);
@@ -7087,6 +7090,8 @@ class _ObjectWorkspaceState extends State<ObjectWorkspace> {
                   vertical: 4,
                 ),
                 child: TextField(
+                  onChanged: (v) =>
+                      setState(() => _objectQuery = v.trim().toLowerCase()),
                   decoration: InputDecoration(
                     hintText: 'Search objects...',
                     prefixIcon: const Icon(Icons.search, size: 16),
@@ -7125,66 +7130,88 @@ class _ObjectWorkspaceState extends State<ObjectWorkspace> {
                       )
                     : ListView(
                         padding: const EdgeInsets.symmetric(horizontal: 4),
-                        children: _objects.entries.map((cat) {
-                          final isUser = cat.key == 'My Objects';
-                          return ExpansionTile(
-                            dense: true,
-                            initiallyExpanded: isUser,
-                            tilePadding: const EdgeInsets.symmetric(
-                              horizontal: 12,
-                            ),
-                            leading: Icon(
-                              isUser ? Icons.person : Icons.folder_outlined,
-                              size: 16,
-                              color: isUser
-                                  ? Theme.of(context).colorScheme.primary
-                                  : Colors.white38,
-                            ),
-                            title: Text(
-                              cat.key,
-                              style: const TextStyle(fontSize: 13),
-                            ),
-                            trailing: Text(
-                              '${cat.value.length}',
-                              style: TextStyle(
-                                fontSize: 11,
-                                color: Colors.white38,
-                              ),
-                            ),
-                            children: cat.value.map((obj) {
-                              final id = obj['id'] as String;
-                              final selected = _selectedObject == id;
-                              return ListTile(
-                                dense: true,
-                                visualDensity: VisualDensity.compact,
-                                selected: selected,
-                                selectedTileColor: Theme.of(
-                                  context,
-                                ).colorScheme.primaryContainer.withOpacity(0.2),
-                                contentPadding: const EdgeInsets.only(
-                                  left: 40,
-                                  right: 8,
+                        children: _objects.entries
+                            .map(
+                              (cat) => MapEntry(cat.key, [
+                                for (final o in cat.value)
+                                  if (_objectQuery.isEmpty ||
+                                      '${o['id']}'.toLowerCase().contains(
+                                        _objectQuery,
+                                      ))
+                                    o,
+                              ]),
+                            )
+                            .where((cat) => cat.value.isNotEmpty)
+                            .map((cat) {
+                              final isUser = cat.key == 'My Objects';
+                              final searching = _objectQuery.isNotEmpty;
+                              return ExpansionTile(
+                                // Searching opens every folder with a match.
+                                key: ValueKey(
+                                  searching ? '${cat.key}*' : cat.key,
                                 ),
-                                leading: Container(
-                                  width: 8,
-                                  height: 8,
-                                  decoration: const BoxDecoration(
-                                    color: Colors.green,
-                                    shape: BoxShape.circle,
-                                  ),
+                                dense: true,
+                                // A lone folder (the desk: everything is
+                                // owner "system" → Other) opens by itself.
+                                initiallyExpanded:
+                                    searching || isUser || _objects.length == 1,
+                                tilePadding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                ),
+                                leading: Icon(
+                                  isUser ? Icons.person : Icons.folder_outlined,
+                                  size: 16,
+                                  color: isUser
+                                      ? Theme.of(context).colorScheme.primary
+                                      : Colors.white38,
                                 ),
                                 title: Text(
-                                  id,
+                                  cat.key,
+                                  style: const TextStyle(fontSize: 13),
+                                ),
+                                trailing: Text(
+                                  '${cat.value.length}',
                                   style: TextStyle(
-                                    fontSize: 12,
-                                    fontFamily: 'monospace',
+                                    fontSize: 11,
+                                    color: Colors.white38,
                                   ),
                                 ),
-                                onTap: () => _selectObject(id),
+                                children: cat.value.map((obj) {
+                                  final id = obj['id'] as String;
+                                  final selected = _selectedObject == id;
+                                  return ListTile(
+                                    dense: true,
+                                    visualDensity: VisualDensity.compact,
+                                    selected: selected,
+                                    selectedTileColor: Theme.of(context)
+                                        .colorScheme
+                                        .primaryContainer
+                                        .withOpacity(0.2),
+                                    contentPadding: const EdgeInsets.only(
+                                      left: 40,
+                                      right: 8,
+                                    ),
+                                    leading: Container(
+                                      width: 8,
+                                      height: 8,
+                                      decoration: const BoxDecoration(
+                                        color: Colors.green,
+                                        shape: BoxShape.circle,
+                                      ),
+                                    ),
+                                    title: Text(
+                                      id,
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        fontFamily: 'monospace',
+                                      ),
+                                    ),
+                                    onTap: () => _selectObject(id),
+                                  );
+                                }).toList(),
                               );
-                            }).toList(),
-                          );
-                        }).toList(),
+                            })
+                            .toList(),
                       ),
               ),
             ],
@@ -7311,7 +7338,7 @@ class _ObjectWorkspaceState extends State<ObjectWorkspace> {
               ),
               const SizedBox(width: 8),
               Tooltip(
-                message: 'Object deletes are disabled on staging',
+                message: 'The server has no object delete yet',
                 child: IconButton(
                   onPressed: null,
                   icon: const Icon(Icons.delete_outline, size: 18),
@@ -8177,8 +8204,41 @@ class _ObjectWorkspaceState extends State<ObjectWorkspace> {
     );
   }
 
+  /// The server only snapshots source when it's saved through it (edit,
+  /// rollback), so a package-installed object has no history yet. Show what
+  /// is running as the one current version rather than an empty tab.
+  Map<String, dynamic>? _installedVersionEntry() {
+    final meta = {...?_selectedObjectInfo, ...?_metadataData};
+    if (meta.isEmpty) return null;
+    final modified = meta['last_modified'];
+    String when = '';
+    if (modified is num) {
+      final t = DateTime.fromMillisecondsSinceEpoch(
+        (modified * 1000).round(),
+      ).toLocal();
+      String two(int n) => n.toString().padLeft(2, '0');
+      when =
+          '${t.year}-${two(t.month)}-${two(t.day)} '
+          '${two(t.hour)}:${two(t.minute)}';
+    }
+    final path = meta['source_path']?.toString() ?? '';
+    return {
+      'version': 'current',
+      'created_at': when,
+      'author': meta['owner']?.toString() ?? 'installed',
+      'message':
+          '${path.isEmpty ? 'Installed source' : 'Installed source ($path)'}'
+          ' · no saved edits yet; history starts with the first edit',
+      '_synthetic': true,
+    };
+  }
+
   Widget _buildVersionsTab() {
-    final versions = _versionsData ?? const [];
+    var versions = _versionsData ?? const [];
+    if (versions.isEmpty) {
+      final installed = _installedVersionEntry();
+      if (installed != null) versions = [installed];
+    }
     final currentVersion = _objectVersionLabel({
       ...?_selectedObjectInfo,
       ...?_metadataData,
@@ -8216,11 +8276,19 @@ class _ObjectWorkspaceState extends State<ObjectWorkspace> {
                 itemBuilder: (context, i) {
                   final raw = versions[i];
                   final version = _mapFromDynamic(raw);
-                  final label = _versionLabel(version);
+                  final label = version['_synthetic'] == true
+                      ? 'installed'
+                      : _versionLabel(version);
+                  // History is newest first and every source save goes
+                  // through it, so with no explicit marker the top is live.
                   final isCurrent =
-                      currentVersion != null && label == currentVersion;
+                      version['_synthetic'] == true ||
+                      (currentVersion != null
+                          ? label == currentVersion
+                          : i == 0);
                   final created =
                       version['created_at']?.toString() ??
+                      version['timestamp']?.toString().replaceFirst('T', ' ') ??
                       version['date']?.toString() ??
                       version['timestamp']?.toString() ??
                       '';

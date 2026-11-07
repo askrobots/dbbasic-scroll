@@ -24,10 +24,12 @@ fi
 # "sandbox": the real-server suite against tool/desk_sandbox.sh (local only).
 # "sweep": every screen, password-signed-in (sandbox started with SESSION_ADMIN=1).
 # "genui": the server's generative UI (apps launcher, views, blocks) natively.
-if [[ "${1:-}" == "sandbox" || "${1:-}" == "sweep" || "${1:-}" == "genui" ]]; then
+# "versions": object version history (sandbox started with SOURCE_WRITES=1).
+if [[ "${1:-}" == "sandbox" || "${1:-}" == "sweep" || "${1:-}" == "genui" || "${1:-}" == "versions" ]]; then
   file=integration_test/sandbox_test.dart
   [[ $1 == sweep ]] && file=integration_test/sandbox_sweep_test.dart
   [[ $1 == genui ]] && file=integration_test/generative_ui_test.dart
+  [[ $1 == versions ]] && file=integration_test/object_versions_test.dart
   shift
   SB=build/desk-sandbox
   [[ -s $SB/admin_token ]] || { echo "start it first: tool/desk_sandbox.sh start" >&2; exit 2; }

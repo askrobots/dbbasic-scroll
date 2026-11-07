@@ -67,6 +67,9 @@ done
 # SESSION_ADMIN=1: also let admin-role password sessions pass the admin gates
 # (the server's documented path for Scroll; off on the desk today).
 [[ ${SESSION_ADMIN:-0} == 1 ]] && env_args+=("DBBASIC_ENABLE_SESSION_ADMIN_GATES=true")
+# SOURCE_WRITES=1: allow creating/editing object source (off on the desk), so
+# version history can be tested locally.
+[[ ${SOURCE_WRITES:-0} == 1 ]] && env_args+=("DBBASIC_ENABLE_SOURCE_WRITES=true")
 
 (cd $SB/code && env "${env_args[@]}" nohup python3 -m uvicorn object_server:app \
    --host 127.0.0.1 --port "$PORT" --log-level info < /dev/null > "$ABS/server.log" 2>&1 & echo $! > "$ABS/server.pid")
