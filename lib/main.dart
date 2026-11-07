@@ -2006,8 +2006,6 @@ class SwitchboardView extends StatelessWidget {
             ).textTheme.bodyLarge?.copyWith(color: Colors.white54),
           ),
           const SizedBox(height: 24),
-          _OperatorStatusPanel(data: d, onNavigate: onNavigate),
-          const SizedBox(height: 32),
 
           // The server's own app launcher (same doors as its web home).
           ServerAppsSection(nav: nav),
@@ -2037,6 +2035,18 @@ class SwitchboardView extends StatelessWidget {
                     color: c.$4,
                     onTap: () => createServerRecord(context, c.$1),
                   ),
+              _ActionCard(
+                icon: Icons.auto_awesome,
+                label: 'Ask AI',
+                color: Colors.amber,
+                onTap: () {
+                  onNavigate?.call(
+                    'AI Create',
+                    const AICreateView(),
+                    Icons.auto_awesome,
+                  );
+                },
+              ),
               _ActionCard(
                 icon: Icons.person_add,
                 label: 'New Contact',
@@ -2142,18 +2152,6 @@ class SwitchboardView extends StatelessWidget {
                 color: Colors.teal,
                 onTap: () {},
               ),
-              _ActionCard(
-                icon: Icons.auto_awesome,
-                label: 'Ask AI',
-                color: Colors.amber,
-                onTap: () {
-                  onNavigate?.call(
-                    'AI Create',
-                    const AICreateView(),
-                    Icons.auto_awesome,
-                  );
-                },
-              ),
             ],
           ),
 
@@ -2185,6 +2183,19 @@ class SwitchboardView extends StatelessWidget {
                     ServerCollectionViews(onNavigate: onNavigate, nav: nav),
                   _TileGroup(
                     children: [
+                      _ViewTile(
+                        icon: Icons.paid_outlined,
+                        title: 'AI Usage',
+                        sub: 'Tokens and cost by model and day',
+                        count: '—',
+                        onTap: () {
+                          onNavigate?.call(
+                            'AI Usage',
+                            const AIUsageView(),
+                            Icons.paid_outlined,
+                          );
+                        },
+                      ),
                       _ViewTile(
                         icon: Icons.people,
                         title: 'Contacts',
@@ -2250,6 +2261,30 @@ class SwitchboardView extends StatelessWidget {
                               onNavigate: onNavigate,
                             ),
                             Icons.check_circle_outline,
+                          );
+                        },
+                      ),
+                      _ViewTile(
+                        icon: Icons.folder,
+                        title: 'Projects',
+                        unavailable: !ScrollAPI().hasPlatform,
+                        sub: ScrollAPI().hasPlatform
+                            ? '${d.projectCount} projects'
+                            : 'Needs a platform URL (AskRobots)',
+                        count: ScrollAPI().hasPlatform
+                            ? '${d.projectCount}'
+                            : '—',
+                        onTap: () {
+                          onNavigate?.call(
+                            'Projects',
+                            LiveListView(
+                              title: 'Projects',
+                              collection: 'projects',
+                              columns: const ['Name', 'Status', 'Created'],
+                              fields: const ['name', 'status', 'created_at'],
+                              onNavigate: onNavigate,
+                            ),
+                            Icons.folder,
                           );
                         },
                       ),
@@ -2415,43 +2450,6 @@ class SwitchboardView extends StatelessWidget {
                           );
                         },
                       ),
-                      _ViewTile(
-                        icon: Icons.folder,
-                        title: 'Projects',
-                        unavailable: !ScrollAPI().hasPlatform,
-                        sub: ScrollAPI().hasPlatform
-                            ? '${d.projectCount} projects'
-                            : 'Needs a platform URL (AskRobots)',
-                        count: ScrollAPI().hasPlatform
-                            ? '${d.projectCount}'
-                            : '—',
-                        onTap: () {
-                          onNavigate?.call(
-                            'Projects',
-                            LiveListView(
-                              title: 'Projects',
-                              collection: 'projects',
-                              columns: const ['Name', 'Status', 'Created'],
-                              fields: const ['name', 'status', 'created_at'],
-                              onNavigate: onNavigate,
-                            ),
-                            Icons.folder,
-                          );
-                        },
-                      ),
-                      _ViewTile(
-                        icon: Icons.paid_outlined,
-                        title: 'AI Usage',
-                        sub: 'Tokens and cost by model and day',
-                        count: '—',
-                        onTap: () {
-                          onNavigate?.call(
-                            'AI Usage',
-                            const AIUsageView(),
-                            Icons.paid_outlined,
-                          );
-                        },
-                      ),
                     ],
                   ),
                 ],
@@ -2513,6 +2511,11 @@ class SwitchboardView extends StatelessWidget {
               ),
             ],
           ),
+          const SizedBox(height: 36),
+
+          // Server/admin status last: useful, but not what people open
+          // Home for.
+          _OperatorStatusPanel(data: d, onNavigate: onNavigate),
         ],
       ),
     );
