@@ -1626,15 +1626,26 @@ class _NotificationBellState extends State<_NotificationBell> {
   void initState() {
     super.initState();
     _load();
-    // Live push when the websocket is up; a slow poll covers reconnect gaps.
+    // Live push when the websocket is up; a slow poll covers reconnect gaps
+    // only. Every read adds a permission-audit line on the server (the desk's
+    // audit log is unrotated on a small disk), so no polling while live.
     _rtDispose = ScrollRealtime().bind('notifications', _load);
-    _poll = Timer.periodic(const Duration(seconds: 120), (_) => _load());
+    _poll = Timer.periodic(const Duration(seconds: 120), (_) {
+      if (!ScrollRealtime().connected.value) _load();
+    });
+    ScrollRealtime().connected.addListener(_onLiveChanged);
+  }
+
+  // Catch up once on reconnect: events sent while the socket was down are lost.
+  void _onLiveChanged() {
+    if (ScrollRealtime().connected.value) _load();
   }
 
   @override
   void dispose() {
     _poll?.cancel();
     _rtDispose?.call();
+    ScrollRealtime().connected.removeListener(_onLiveChanged);
     super.dispose();
   }
 
