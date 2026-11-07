@@ -72,6 +72,18 @@ class ServerUiNav {
       return;
     }
     final segs = path.split('/').where((s) => s.isNotEmpty).toList();
+    // /views/{id}: a view by record id (the web serves these at that path).
+    if (segs.length == 2 && segs[0] == 'views') {
+      final byId = views.where((v) => v.id == segs[1]).firstOrNull;
+      if (byId != null) {
+        go(
+          byId.title,
+          ServerViewPage(view: byId, nav: this),
+          Icons.web_asset_outlined,
+        );
+        return;
+      }
+    }
     if (segs.isNotEmpty &&
         segs.length <= 2 &&
         await collectionReadable(segs[0])) {

@@ -99,8 +99,10 @@ void main() {
     await pumpUntilFound(tester, find.text('action_nav_entries'));
 
     await pumpUntilFound(tester, find.text(id));
-    await tester.ensureVisible(find.text(id));
-    await tester.tap(find.text(id));
+    // Earlier runs leave objects behind (no object delete), so search.
+    await tester.enterText(find.byKey(const Key('object-search')), id);
+    await pumpFor(tester, const Duration(milliseconds: 500));
+    await tester.tap(find.text(id).last);
     await pumpUntilFound(tester, find.text('Versions'));
     await tester.tap(find.text('Versions'));
     await pumpUntilFound(tester, find.text('say v2'));
@@ -119,8 +121,10 @@ void main() {
     );
 
     // A package object: never edited, so no saved history on the server.
+    await tester.tap(find.byKey(const Key('object-search')));
+    await tester.pump();
     await tester.enterText(
-      find.widgetWithText(TextField, 'Search objects...'),
+      find.byKey(const Key('object-search')),
       'action_nav',
     );
     await pumpFor(tester, const Duration(milliseconds: 500));

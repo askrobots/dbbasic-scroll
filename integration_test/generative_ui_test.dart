@@ -14,6 +14,7 @@ import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:dbbasic_scroll/api.dart';
+import 'package:dbbasic_scroll/command_box.dart';
 import 'package:dbbasic_scroll/main.dart';
 import 'package:dbbasic_scroll/server_apps.dart';
 import 'package:dbbasic_scroll/server_profiles.dart';
@@ -21,6 +22,7 @@ import 'package:dbbasic_scroll/server_ui.dart';
 import 'package:dbbasic_scroll/view_renderer.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 
@@ -323,6 +325,120 @@ void main() {
     );
     expect(find.text("related block's match did not resolve"), findsOneWidget);
     expect(find.text('Unsupported block kind: sparkle'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('command box: ⌘K, / commands with Tab, a note saved through '
+      'the server, live search → open the hit, ⌘↵ Find', (tester) async {
+    if (!configured) return markTestSkipped('sandbox not configured');
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final noteText = 'Boxnote$stamp from the command box';
+    addTearDown(() async {
+      for (final r in await records('notes')) {
+        if ('${r['content']}'.startsWith('Boxnote$stamp')) {
+          await admin('DELETE', 'admin/collections/notes/records/${r['id']}');
+        }
+      }
+    });
+
+    useLaptopSurface(tester);
+    await ServerProfileStore().upsert(
+      ServerProfile(
+        id: ServerProfile.idForUrl(_url),
+        name: 'Sandbox key',
+        objectServerUrl: _url,
+        token: _apiKey,
+      ),
+    );
+    await tester.pumpWidget(
+      RepaintBoundary(key: shotKey, child: const ScrollApp()),
+    );
+    await pumpUntilFound(tester, find.text('Sandbox key'));
+    await tester.tap(find.text('Sandbox key'));
+    await pumpUntilFound(tester, find.text('APPS'));
+
+    final box = find.byKey(const Key('command-box'));
+    String boxText() => tester.widget<TextField>(box).controller!.text;
+
+    // ⌘K from anywhere focuses the box and opens Quick start.
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyK);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+    await pumpUntilFound(tester, find.text('QUICK START'));
+    expect(find.text('all ${boxCommands.length} commands'), findsOneWidget);
+    await shot(tester, '6_box_quick_start');
+
+    // "/" lists commands; links isn't installed here, so /link is greyed.
+    await tester.enterText(box, '/');
+    await pumpUntilFound(tester, find.text('/link'));
+    await pumpUntilFound(
+      tester,
+      find.textContaining('not installed on this server'),
+    );
+    await shot(tester, '7_box_commands');
+
+    // Partial word + Tab completes; Enter runs it as the signed-in user.
+    await tester.enterText(box, '/no');
+    await pumpUntilFound(tester, find.text('save a private note'));
+    await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+    await tester.pump();
+    expect(boxText(), '/note ');
+    await tester.enterText(box, '/note $noteText');
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await pumpUntilFound(tester, find.text('Note saved'));
+    final saved = (await records(
+      'notes',
+    )).where((r) => r['content'] == noteText).toList();
+    expect(saved, hasLength(1), reason: 'the note reached the server');
+    expect(saved.single['owner_id'], 'dan', reason: 'server-stamped owner');
+    expect(saved.single['is_public'], 'false');
+
+    // Plain text: live search; the hit opens the note's page.
+    await tester.tap(box);
+    await tester.enterText(box, 'Boxnote$stamp');
+    await pumpUntilFound(tester, find.text('NOTES'));
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('command-box-dropdown')),
+        matching: find.text('Ask AI'),
+      ),
+      findsNWidgets(2),
+      reason: 'the Ask AI row + the Enter legend',
+    );
+    await shot(tester, '8_box_search');
+    await tester.tap(
+      find.descendant(
+        of: find.byKey(const Key('command-box-dropdown')),
+        // The hit row (Ask AI / Find rows only echo the typed words).
+        matching: find.textContaining('from the command box'),
+      ),
+    );
+    await pumpUntilFound(tester, find.text('Edit'));
+    expect(find.text(noteText), findsWidgets);
+
+    // ⌘↵ = Find: the Search screen, already searched.
+    await tester.tap(box);
+    await tester.enterText(box, 'Boxnote$stamp');
+    await tester.pump();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+    await pumpUntilFound(tester, find.byType(GlobalSearchView));
+    await pumpUntilFound(
+      tester,
+      find.descendant(
+        of: find.byType(GlobalSearchView),
+        matching: find.textContaining('Boxnote$stamp'),
+      ),
+    );
+
+    // Esc closes the dropdown.
+    await tester.tap(box);
+    await pumpUntilFound(tester, find.byKey(const Key('command-box-dropdown')));
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await pumpUntilGone(tester, find.byKey(const Key('command-box-dropdown')));
+    expect(find.text('Session expired'), findsNothing);
     expect(tester.takeException(), isNull);
   });
 }

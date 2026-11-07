@@ -5,6 +5,7 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'ai_usage_view.dart';
 import 'api.dart';
+import 'command_box.dart';
 import 'data.dart';
 import 'diagram_view.dart';
 import 'home_collections.dart';
@@ -1364,56 +1365,35 @@ class _AppBar extends StatelessWidget {
               ],
             ),
           ),
-          // AI bar — takes the free space, right-aligned, max 340 wide;
-          // shrinks in narrow windows instead of overflowing.
+          // Command box (⌘K) — takes the free space, right-aligned, max 460
+          // wide; shrinks in narrow windows instead of overflowing.
           Expanded(
             child: Align(
               alignment: Alignment.centerRight,
               child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 340),
-                child: SizedBox(
-                  height: 36,
-                  child: TextField(
-                    decoration: InputDecoration(
-                      hintText: 'Search... "deals" "invoices" "contact name"',
-                      hintStyle: const TextStyle(
-                        fontSize: 12,
-                        color: Colors.white24,
-                      ),
-                      prefixIcon: const Icon(
-                        Icons.search,
-                        size: 16,
-                        color: Colors.amber,
-                      ),
-                      suffixIcon: const Icon(
-                        Icons.mic_outlined,
-                        size: 16,
-                        color: Colors.white24,
-                      ),
-                      isDense: true,
-                      contentPadding: const EdgeInsets.symmetric(vertical: 8),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(20),
-                        borderSide: BorderSide(color: Colors.white12),
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(20),
-                        borderSide: BorderSide(color: Colors.white12),
-                      ),
-                    ),
-                    style: const TextStyle(fontSize: 13),
-                    onSubmitted: (query) {
-                      if (query.trim().isNotEmpty) {
-                        onNavigate(
-                          'Search: $query',
-                          SearchResultsView(
-                            query: query,
+                constraints: const BoxConstraints(maxWidth: 460),
+                child: CommandBox(
+                  nav: ServerUiNav(
+                    navigate: onNavigate,
+                    native: (path) =>
+                        path == '/shell' ? const AIChatView() : null,
+                  ),
+                  onAsk: (question) => onNavigate(
+                    'AI Chat',
+                    AIChatView(initialMessage: question),
+                    Icons.auto_awesome,
+                  ),
+                  // Platform connections keep the platform's search; the
+                  // object server's own search otherwise.
+                  onFind: (words) => onNavigate(
+                    'Search: $words',
+                    ScrollAPI().hasPlatform
+                        ? SearchResultsView(
+                            query: words,
                             onNavigate: onNavigate,
-                          ),
-                          Icons.search,
-                        );
-                      }
-                    },
+                          )
+                        : GlobalSearchView(initialQuery: words),
+                    Icons.search,
                   ),
                 ),
               ),
@@ -7093,6 +7073,7 @@ class _ObjectWorkspaceState extends State<ObjectWorkspace> {
                   vertical: 4,
                 ),
                 child: TextField(
+                  key: const Key('object-search'),
                   onChanged: (v) =>
                       setState(() => _objectQuery = v.trim().toLowerCase()),
                   decoration: InputDecoration(
@@ -14017,7 +13998,10 @@ class _IdentityRegistryViewState extends State<IdentityRegistryView> {
 // ---------------------------------------------------------------------------
 
 class AIChatView extends StatefulWidget {
-  const AIChatView({super.key});
+  /// Sent as the first message once history has loaded (the command box's
+  /// "Ask AI").
+  final String? initialMessage;
+  const AIChatView({super.key, this.initialMessage});
 
   @override
   State<AIChatView> createState() => _AIChatViewState();
@@ -14057,7 +14041,12 @@ class _AIChatViewState extends State<AIChatView> {
   @override
   void initState() {
     super.initState();
-    _loadShellState();
+    _loadShellState().catchError((_) {}).whenComplete(() {
+      final first = widget.initialMessage?.trim() ?? '';
+      if (!mounted || first.isEmpty) return;
+      _messageController.text = first;
+      _send();
+    });
   }
 
   @override
@@ -14495,7 +14484,9 @@ class _AIChatViewState extends State<AIChatView> {
 // ---------------------------------------------------------------------------
 
 class GlobalSearchView extends StatefulWidget {
-  const GlobalSearchView({super.key});
+  /// Searched straight away (the command box's "Find").
+  final String? initialQuery;
+  const GlobalSearchView({super.key, this.initialQuery});
 
   @override
   State<GlobalSearchView> createState() => _GlobalSearchViewState();
@@ -14509,6 +14500,18 @@ class _GlobalSearchViewState extends State<GlobalSearchView> {
   bool _loading = false;
   String? _error;
   String? _searchedQuery;
+
+  @override
+  void initState() {
+    super.initState();
+    final q = widget.initialQuery?.trim() ?? '';
+    if (q.isNotEmpty) {
+      _queryController.text = q;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _search();
+      });
+    }
+  }
 
   @override
   void dispose() {
