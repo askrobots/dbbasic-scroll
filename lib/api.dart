@@ -1,9 +1,111 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 enum _AuthMode { none, objectServer, platform }
+
+/// How the current connection authenticates. Decides what a 401/403 means.
+enum CredentialKind {
+  /// Password sign-in (POST /identity/session): expires after its TTL.
+  session,
+
+  /// A user API key (`dbk_…`): does not expire; never passes admin-token gates.
+  apiKey,
+
+  /// The deployment admin token: passes every admin gate.
+  adminToken,
+}
+
+/// What Scroll should conclude from a failed request.
+enum AuthSignal {
+  /// Nothing to do (not an auth failure, or expected for this credential).
+  none,
+
+  /// The credential is valid but not allowed here: show "locked".
+  locked,
+
+  /// The credential is dead: prompt "Sign in again".
+  expired,
+
+  /// Ambiguous for a session: ask GET /identity/session (200 alive, 401 dead).
+  probeSession,
+}
+
+/// Classify a 401/403 from [url] for a connection using [kind].
+///
+/// Verified against the object server at the desk's commit (6707021) with
+/// permission enforcement on:
+/// * admin-gated routes (/admin, /daemon, /permissions, metrics) answer 401 to
+///   anything but the admin token;
+/// * /collections/* answers **403** to an expired or unknown credential (it is
+///   treated as anonymous), not 401 — so a 401-only rule never notices expiry;
+/// * GET /identity/session is 200 only for a live password session; it is 401
+///   for API keys and the admin token too.
+@visibleForTesting
+AuthSignal classifyAuthFailure(int status, String url, CredentialKind kind) {
+  if (status != 401 && status != 403) return AuthSignal.none;
+  final segments = Uri.tryParse(url)?.pathSegments ?? const <String>[];
+  final first = segments.isEmpty ? '' : segments.first;
+  final isSessionProbe =
+      segments.length >= 2 && first == 'identity' && segments[1] == 'session';
+  switch (kind) {
+    case CredentialKind.apiKey:
+      // Keys don't expire; a 401 is an admin-token gate.
+      return status == 401 ? AuthSignal.locked : AuthSignal.none;
+    case CredentialKind.adminToken:
+      // The admin token passes every gate, so a 401 means it is wrong or was
+      // rotated — except /identity/session, which only knows sessions.
+      if (status == 401 && !isSessionProbe) return AuthSignal.expired;
+      return AuthSignal.none;
+    case CredentialKind.session:
+      if (isSessionProbe) {
+        return status == 401 ? AuthSignal.expired : AuthSignal.none;
+      }
+      return AuthSignal.probeSession;
+  }
+}
+
+/// The credential kind for a saved connection. Uses the stored kind when
+/// present; connections saved before it existed are inferred from the token
+/// (`dbk_` = API key) or a stored session user. Guessing "admin token" for an
+/// API key would turn every admin 401 into a false "Session expired".
+CredentialKind inferCredentialKind({
+  String? stored,
+  String? token,
+  String? sessionUserId,
+}) {
+  for (final k in CredentialKind.values) {
+    if (k.name == stored) return k;
+  }
+  if (token != null && token.startsWith('dbk_')) return CredentialKind.apiKey;
+  if (sessionUserId != null && sessionUserId.isNotEmpty) {
+    return CredentialKind.session;
+  }
+  return CredentialKind.adminToken;
+}
+
+/// Human-readable text for a failed request, for screens to show instead of
+/// a bare "HTTP 401".
+///
+/// The object server answers 401 (not 403) when a valid credential isn't
+/// allowed on an admin-gated route, so 401 here usually means "locked", not
+/// "signed out" (real expiry is handled separately, see
+/// [classifyAuthFailure]).
+String httpFailure(Object? status, [Object? error]) {
+  if (status == 401) {
+    return 'Locked (HTTP 401): this connection isn\'t allowed here. Admin '
+        'screens need the server\'s admin token, or a password sign-in as an '
+        'admin user on a server with DBBASIC_ENABLE_SESSION_ADMIN_GATES on. '
+        'API keys never open them.';
+  }
+  if (status == 403) {
+    return 'Not enabled or not permitted (HTTP 403): the server has this '
+        'feature turned off or your role doesn\'t allow it.';
+  }
+  return 'HTTP ${status ?? error ?? '?'}';
+}
 
 /// Scroll connects to two services:
 /// 1. Object Server (required) — Python objects, execution, state, clustering
@@ -46,12 +148,88 @@ class ScrollAPI {
   /// listens and prompts the operator to sign in again.
   final ValueNotifier<bool> authRejected = ValueNotifier(false);
 
-  void _noteAuthResult(int statusCode, _AuthMode authMode) {
-    if (statusCode == 401 &&
-        authMode == _AuthMode.objectServer &&
-        isConnected) {
-      authRejected.value = true;
+  /// True once an admin-gated route answered 401 on this connection: the
+  /// credential is valid but not an admin (e.g. an API key). Screens use it
+  /// to say "locked" instead of a misleading "No collections" / "No changes".
+  final ValueNotifier<bool> adminLocked = ValueNotifier(false);
+
+  CredentialKind _credentialKind = CredentialKind.adminToken;
+
+  /// How this connection authenticates (see [classifyAuthFailure]).
+  CredentialKind get credentialKind => _credentialKind;
+
+  void _noteAuthResult(int statusCode, _AuthMode authMode, String url) {
+    if (authMode != _AuthMode.objectServer || !isConnected) return;
+    final signal = classifyAuthFailure(statusCode, url, _credentialKind);
+    if (signal == AuthSignal.none) return;
+    if (statusCode == 401) adminLocked.value = true; // provisional for sessions
+    switch (signal) {
+      case AuthSignal.expired:
+        authRejected.value = true;
+      case AuthSignal.probeSession:
+        _probeSession();
+      case AuthSignal.locked:
+      case AuthSignal.none:
+        break;
     }
+  }
+
+  DateTime? _lastSessionProbe;
+  bool _probingSession = false;
+  Timer? _deferredProbe;
+  static const _probeGap = Duration(seconds: 10);
+
+  /// Ask the server whether the session is still alive. At most one probe
+  /// per [_probeGap]; a failure inside the gap schedules one deferred probe
+  /// rather than being dropped (dropping it could hide an expiry until the
+  /// next poll). Uses the raw client so it never re-enters [_noteAuthResult].
+  void _probeSession() {
+    if (_probingSession) return;
+    final last = _lastSessionProbe;
+    final now = DateTime.now();
+    if (last != null && now.difference(last) < _probeGap) {
+      _deferredProbe ??= Timer(_probeGap - now.difference(last), () {
+        _deferredProbe = null;
+        _probeSession();
+      });
+      return;
+    }
+    _probingSession = true;
+    _lastSessionProbe = now;
+    () async {
+      try {
+        final response = await _client.get(
+          Uri.parse(_objUrl('identity/session')),
+          headers: _headers(),
+        );
+        if (response.statusCode == 401 && isConnected) {
+          authRejected.value = true;
+        }
+      } catch (_) {
+        // Network trouble is not evidence of expiry.
+      } finally {
+        _probingSession = false;
+      }
+    }();
+  }
+
+  /// Work out what [token] is: `dbk_` → API key; a known password-session
+  /// user → session; otherwise ask the server (a live session answers 200 on
+  /// GET /identity/session) and fall back to the admin token.
+  Future<CredentialKind> _detectCredentialKind(
+    String base,
+    String token,
+  ) async {
+    if (token.startsWith('dbk_')) return CredentialKind.apiKey;
+    if (_sessionUserId != null) return CredentialKind.session;
+    try {
+      final response = await _client.get(
+        Uri.parse('${base}identity/session'),
+        headers: _headers(token: token),
+      );
+      if (response.statusCode == 200) return CredentialKind.session;
+    } catch (_) {}
+    return CredentialKind.adminToken;
   }
 
   // --- Connection ---
@@ -62,6 +240,11 @@ class ScrollAPI {
     _platformUrl = prefs.getString('platform_url');
     _token = prefs.getString('server_token');
     _sessionUserId = prefs.getString('session_user_id');
+    _credentialKind = inferCredentialKind(
+      stored: prefs.getString('credential_kind'),
+      token: _token,
+      sessionUserId: _sessionUserId,
+    );
   }
 
   Future<bool> connect({
@@ -77,9 +260,16 @@ class ScrollAPI {
       final health = await _getRaw('${objUrl}health');
       if (health == null) return false;
 
+      _credentialKind = await _detectCredentialKind(objUrl, token);
+      _lastSessionProbe = null;
+      _deferredProbe?.cancel();
+      _deferredProbe = null;
       _objectServerUrl = objUrl;
       _token = token;
+      // A new connection never inherits the previous server's platform URL.
+      _platformUrl = null;
       authRejected.value = false;
+      adminLocked.value = false;
 
       // Test platform connection if provided
       if (platformUrl != null && platformUrl.isNotEmpty) {
@@ -99,8 +289,11 @@ class ScrollAPI {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('object_server_url', _objectServerUrl!);
       await prefs.setString('server_token', _token!);
+      await prefs.setString('credential_kind', _credentialKind.name);
       if (_platformUrl != null) {
         await prefs.setString('platform_url', _platformUrl!);
+      } else {
+        await prefs.remove('platform_url');
       }
       return true;
     } catch (_) {}
@@ -458,11 +651,16 @@ No markdown, no backticks, no explanations. Only JSON.''';
     _token = null;
     _sessionUserId = null;
     authRejected.value = false;
+    adminLocked.value = false;
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('object_server_url');
     await prefs.remove('platform_url');
     await prefs.remove('server_token');
     await prefs.remove('session_user_id');
+    await prefs.remove('credential_kind');
+    _credentialKind = CredentialKind.adminToken;
+    _deferredProbe?.cancel();
+    _deferredProbe = null;
   }
 
   // --- HTTP helpers ---
@@ -518,7 +716,7 @@ No markdown, no backticks, no explanations. Only JSON.''';
         'DELETE' => await _client.delete(uri, headers: headers),
         _ => await _client.get(uri, headers: headers),
       };
-      _noteAuthResult(response.statusCode, authMode);
+      _noteAuthResult(response.statusCode, authMode, uri.toString());
       return {
         'status': response.statusCode,
         'body': _decodeResponseBody(response.body),
@@ -551,7 +749,7 @@ No markdown, no backticks, no explanations. Only JSON.''';
         lastError = null;
         return _decodeResponseBody(response.body);
       }
-      _noteAuthResult(response.statusCode, authMode);
+      _noteAuthResult(response.statusCode, authMode, url);
       lastError = 'HTTP ${response.statusCode}: ${response.body}';
     } catch (e) {
       lastError = 'Error: $e';
@@ -577,7 +775,7 @@ No markdown, no backticks, no explanations. Only JSON.''';
         lastError = null;
         return _decodeResponseBody(response.body);
       }
-      _noteAuthResult(response.statusCode, authMode);
+      _noteAuthResult(response.statusCode, authMode, url);
       lastError = 'HTTP ${response.statusCode}: ${response.body}';
     } catch (e) {
       lastError = 'Error: $e';
@@ -599,7 +797,7 @@ No markdown, no backticks, no explanations. Only JSON.''';
       if (response.statusCode == 200) {
         return _decodeResponseBody(response.body);
       }
-      _noteAuthResult(response.statusCode, authMode);
+      _noteAuthResult(response.statusCode, authMode, url);
     } catch (_) {}
     return null;
   }
@@ -613,7 +811,7 @@ No markdown, no backticks, no explanations. Only JSON.''';
         Uri.parse(url),
         headers: _headers(authMode: authMode),
       );
-      _noteAuthResult(response.statusCode, authMode);
+      _noteAuthResult(response.statusCode, authMode, url);
       return response.statusCode == 200 || response.statusCode == 204;
     } catch (_) {}
     return false;
@@ -750,7 +948,11 @@ No markdown, no backticks, no explanations. Only JSON.''';
       final response = await _client
           .get(uri, headers: _headers())
           .timeout(const Duration(seconds: 90));
-      _noteAuthResult(response.statusCode, _AuthMode.objectServer);
+      _noteAuthResult(
+        response.statusCode,
+        _AuthMode.objectServer,
+        uri.toString(),
+      );
       if (response.statusCode >= 200 && response.statusCode < 300) {
         var filename = 'backup-$id.tar.gz';
         final disposition = response.headers['content-disposition'];

@@ -3,10 +3,15 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'ai_usage_view.dart';
 import 'api.dart';
 import 'data.dart';
+import 'diagram_view.dart';
+import 'home_collections.dart';
+import 'query_view.dart';
 import 'realtime.dart';
 import 'schema_form.dart';
+import 'server_profiles.dart';
 
 /// Record keys that are internal plumbing, never shown as a data column:
 /// the id, the owner pointer, and the `extra` overflow blob (a JSON string
@@ -414,6 +419,66 @@ class _AdminFieldOverlayState extends State<AdminFieldOverlay> {
   }
 }
 
+/// Shown instead of an empty state when the list is empty only because the
+/// connection is not an admin (admin routes answered 401).
+class LockedNotice extends StatelessWidget {
+  final String what;
+  const LockedNotice({super.key, required this.what});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.lock_outline, size: 36, color: Colors.white38),
+            const SizedBox(height: 10),
+            Text(
+              'Locked: can\'t list $what',
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              'This connection isn\'t an admin. Sign in with your password as '
+              'an admin user (the server must have '
+              'DBBASIC_ENABLE_SESSION_ADMIN_GATES on), or use the server\'s '
+              'admin token. API keys never open admin screens.',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12, color: Colors.white38),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Make [profile] the live connection. Returns null on success, or a message
+/// for the operator. On failure the previous connection is left untouched.
+///
+/// The caller navigates to a fresh [MainShell] afterwards so every screen
+/// reloads against the new server.
+Future<String?> activateProfile(ServerProfile profile) async {
+  final api = ScrollAPI();
+  final previousUser = api.sessionUserId;
+  await api.setSessionUser(profile.sessionUserId);
+  final ok = await api.connect(
+    objectServerUrl: profile.objectServerUrl,
+    token: profile.token,
+    platformUrl: profile.platformUrl,
+  );
+  if (!ok) {
+    await api.setSessionUser(previousUser);
+    return 'Could not reach ${profile.name} (${profile.objectServerUrl}).';
+  }
+  ScrollRealtime().shutdown();
+  ScrollData().clear();
+  await ServerProfileStore().upsert(profile);
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Connect Screen
 // ---------------------------------------------------------------------------
@@ -431,6 +496,9 @@ class _ConnectScreenState extends State<ConnectScreen> {
   final _tokenController = TextEditingController();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
+  final _profileNameController = TextEditingController();
+  final _profileStore = ServerProfileStore();
+  List<ServerProfile> _profiles = [];
   bool _usePasswordLogin = false;
   bool _connecting = false;
   String? _error;
@@ -440,6 +508,48 @@ class _ConnectScreenState extends State<ConnectScreen> {
   void initState() {
     super.initState();
     _tryAutoConnect();
+    _loadProfiles();
+  }
+
+  Future<void> _loadProfiles() async {
+    final profiles = await _profileStore.list();
+    if (mounted) setState(() => _profiles = profiles);
+  }
+
+  /// Default profile name: the server's host (and port, for tunnels).
+  String _defaultProfileName(String url) {
+    final uri = Uri.tryParse(url.trim());
+    if (uri == null || uri.host.isEmpty) return url.trim();
+    return uri.hasPort ? '${uri.host}:${uri.port}' : uri.host;
+  }
+
+  /// Connect with a saved profile's stored credential (no re-typing). If the
+  /// server has since rejected it (e.g. an expired session) the shell's 401
+  /// prompt sends the operator back here to sign in again.
+  Future<void> _connectWithProfile(ServerProfile profile) async {
+    setState(() {
+      _connecting = true;
+      _error = null;
+      _status = 'Connecting to ${profile.name}...';
+    });
+    final error = await activateProfile(profile);
+    if (!mounted) return;
+    if (error == null) {
+      Navigator.of(
+        context,
+      ).pushReplacement(MaterialPageRoute(builder: (_) => const MainShell()));
+    } else {
+      setState(() {
+        _connecting = false;
+        _error = error;
+        _status = null;
+      });
+    }
+  }
+
+  Future<void> _removeProfile(ServerProfile profile) async {
+    await _profileStore.remove(profile.id);
+    await _loadProfiles();
   }
 
   Future<void> _tryAutoConnect() async {
@@ -496,9 +606,18 @@ class _ConnectScreenState extends State<ConnectScreen> {
       final api = ScrollAPI();
       final login = await api.loginWithPassword(
         objectServerUrl: _objUrlController.text.trim(),
-        email: _emailController.text,
+        // Desk users (e.g. "dan") have a user id and no email.
+        email: _emailController.text.contains('@')
+            ? _emailController.text
+            : null,
+        userId: _emailController.text.contains('@')
+            ? null
+            : _emailController.text,
         password: _passwordController.text,
         label: 'scroll login',
+        // Server default is 24 h (max 30 days); a week keeps the operator
+        // from re-signing in daily without a near-permanent token.
+        ttlSeconds: 7 * 24 * 3600,
       );
       if (!mounted) return;
       final status = login['status'];
@@ -541,6 +660,20 @@ class _ConnectScreenState extends State<ConnectScreen> {
     if (!mounted) return;
     if (success) {
       final api = ScrollAPI();
+      final profileName = _profileNameController.text.trim().isEmpty
+          ? _defaultProfileName(_objUrlController.text)
+          : _profileNameController.text.trim();
+      await _profileStore.upsert(
+        ServerProfile(
+          id: ServerProfile.idForUrl(api.objectServerUrl ?? ''),
+          name: profileName,
+          objectServerUrl: api.objectServerUrl ?? '',
+          platformUrl: api.platformUrl,
+          token: token,
+          sessionUserId: api.sessionUserId,
+        ),
+      );
+      if (!mounted) return;
       setState(() {
         _status =
             'Connected! Object server${api.hasPlatform ? " + platform" : ""}';
@@ -601,6 +734,17 @@ class _ConnectScreenState extends State<ConnectScreen> {
                 ),
                 const SizedBox(height: 12),
                 TextField(
+                  controller: _profileNameController,
+                  decoration: const InputDecoration(
+                    labelText: 'Save as (optional)',
+                    prefixIcon: Icon(Icons.bookmark_outline),
+                    border: OutlineInputBorder(),
+                    hintText: 'Production, nc VM (tunnel), ...',
+                  ),
+                  enabled: !_connecting,
+                ),
+                const SizedBox(height: 12),
+                TextField(
                   controller: _platUrlController,
                   decoration: InputDecoration(
                     labelText: 'Platform URL (optional)',
@@ -620,12 +764,12 @@ class _ConnectScreenState extends State<ConnectScreen> {
                     segments: const [
                       ButtonSegment(
                         value: false,
-                        label: Text('Admin Token'),
+                        label: Text('Token or API key'),
                         icon: Icon(Icons.key_outlined, size: 16),
                       ),
                       ButtonSegment(
                         value: true,
-                        label: Text('Email + Password'),
+                        label: Text('Password'),
                         icon: Icon(Icons.person_outline, size: 16),
                       ),
                     ],
@@ -642,7 +786,7 @@ class _ConnectScreenState extends State<ConnectScreen> {
                   TextField(
                     controller: _emailController,
                     decoration: const InputDecoration(
-                      labelText: 'Email',
+                      labelText: 'Email or user id',
                       prefixIcon: Icon(Icons.alternate_email_outlined),
                       border: OutlineInputBorder(),
                     ),
@@ -723,11 +867,39 @@ class _ConnectScreenState extends State<ConnectScreen> {
                     ),
                   ),
                 ),
-                const SizedBox(height: 12),
-                TextButton(
-                  onPressed: () {},
-                  child: const Text('Saved Connections'),
-                ),
+                if (_profiles.isNotEmpty) ...[
+                  const SizedBox(height: 24),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      'Saved connections',
+                      style: Theme.of(
+                        context,
+                      ).textTheme.labelLarge?.copyWith(color: Colors.white54),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  for (final profile in _profiles)
+                    Card(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      child: ListTile(
+                        dense: true,
+                        leading: const Icon(Icons.dns_outlined),
+                        title: Text(profile.name),
+                        subtitle: Text(profile.objectServerUrl),
+                        onTap: _connecting
+                            ? null
+                            : () => _connectWithProfile(profile),
+                        trailing: IconButton(
+                          tooltip: 'Forget this connection',
+                          icon: const Icon(Icons.delete_outline, size: 18),
+                          onPressed: _connecting
+                              ? null
+                              : () => _removeProfile(profile),
+                        ),
+                      ),
+                    ),
+                ],
               ],
             ),
           ),
@@ -764,7 +936,8 @@ class _MainShellState extends State<MainShell> {
     _NavItem('Users', Icons.manage_accounts_outlined),
     _NavItem('Permissions', Icons.security_outlined),
     _NavItem('API', Icons.api_outlined),
-    _NavItem('SQL', Icons.terminal_outlined),
+    _NavItem('SQL', Icons.terminal_outlined, mockup: true),
+    _NavItem('Query', Icons.manage_search_outlined),
     _NavItem('Daemon', Icons.hub_outlined),
     _NavItem('Changes', Icons.manage_history_outlined),
     _NavItem('Ops', Icons.monitor_heart_outlined),
@@ -881,15 +1054,16 @@ class _MainShellState extends State<MainShell> {
       6 => const IdentityRegistryView(),
       7 => const PermissionsView(),
       8 => const APIExplorerView(),
-      9 => const SQLQueryView(),
-      10 => const DaemonStatusView(),
-      11 => const ChangesView(),
-      12 => const OpsEventsView(),
-      13 => const FileManagerView(),
-      14 => const SchemaEditorView(),
-      15 => const DiagramView(),
-      16 => const PackageManagerView(),
-      17 => const BackupView(),
+      9 => const MockupFrame(what: 'SQL console', child: SQLQueryView()),
+      10 => const QueryView(),
+      11 => const DaemonStatusView(),
+      12 => const ChangesView(),
+      13 => const OpsEventsView(),
+      14 => const FileManagerView(),
+      15 => const SchemaEditorView(),
+      16 => const DiagramScreen(),
+      17 => const PackageManagerView(),
+      18 => const BackupView(),
       _ => SwitchboardView(onNavigate: _navigate),
     };
   }
@@ -970,6 +1144,9 @@ class _MainShellState extends State<MainShell> {
               ),
             Expanded(
               child: Row(
+                // stretch: otherwise every screen shorter than the window is
+                // vertically centred, and the divider below has no height.
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   if (_adminMode) _buildAdminNavRail(context),
                   if (_adminMode) Container(width: 1, color: Colors.white10),
@@ -993,6 +1170,7 @@ class _MainShellState extends State<MainShell> {
           const SizedBox(height: 4),
           Expanded(
             child: ListView(
+              key: const Key('admin-nav-rail'),
               padding: EdgeInsets.zero,
               children: List.generate(_adminNavItems.length, (i) {
                 final item = _adminNavItems[i];
@@ -1025,7 +1203,7 @@ class _MainShellState extends State<MainShell> {
                           size: 18,
                           color: selected
                               ? Theme.of(context).colorScheme.primary
-                              : Colors.white38,
+                              : (item.mockup ? kMockupColor : Colors.white38),
                         ),
                         const SizedBox(height: 2),
                         Text(
@@ -1037,7 +1215,10 @@ class _MainShellState extends State<MainShell> {
                                 : FontWeight.normal,
                             color: selected
                                 ? Theme.of(context).colorScheme.primary
-                                : Colors.white54,
+                                : (item.mockup ? kMockupColor : Colors.white54),
+                            fontStyle: item.mockup
+                                ? FontStyle.italic
+                                : FontStyle.normal,
                           ),
                           textAlign: TextAlign.center,
                           overflow: TextOverflow.ellipsis,
@@ -1090,7 +1271,10 @@ class _MainShellState extends State<MainShell> {
 class _NavItem {
   final String label;
   final IconData icon;
-  _NavItem(this.label, this.icon);
+
+  /// Planned screen shown as a design mockup (pink, not grey).
+  final bool mockup;
+  _NavItem(this.label, this.icon, {this.mockup = false});
 }
 
 class _Screen {
@@ -1155,51 +1339,65 @@ class _AppBar extends StatelessWidget {
                 const SizedBox(width: 10),
                 Text(
                   title == 'Home' ? 'DBBasic Scroll' : title,
+                  overflow: TextOverflow.ellipsis,
                   style: Theme.of(context).textTheme.titleMedium,
                 ),
               ],
             ),
           ),
-          const Spacer(),
-          // AI bar
-          SizedBox(
-            width: 340,
-            height: 36,
-            child: TextField(
-              decoration: InputDecoration(
-                hintText: 'Search... "deals" "invoices" "contact name"',
-                hintStyle: const TextStyle(fontSize: 12, color: Colors.white24),
-                prefixIcon: const Icon(
-                  Icons.search,
-                  size: 16,
-                  color: Colors.amber,
-                ),
-                suffixIcon: const Icon(
-                  Icons.mic_outlined,
-                  size: 16,
-                  color: Colors.white24,
-                ),
-                isDense: true,
-                contentPadding: const EdgeInsets.symmetric(vertical: 8),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(20),
-                  borderSide: BorderSide(color: Colors.white12),
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(20),
-                  borderSide: BorderSide(color: Colors.white12),
+          // AI bar — takes the free space, right-aligned, max 340 wide;
+          // shrinks in narrow windows instead of overflowing.
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 340),
+                child: SizedBox(
+                  height: 36,
+                  child: TextField(
+                    decoration: InputDecoration(
+                      hintText: 'Search... "deals" "invoices" "contact name"',
+                      hintStyle: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.white24,
+                      ),
+                      prefixIcon: const Icon(
+                        Icons.search,
+                        size: 16,
+                        color: Colors.amber,
+                      ),
+                      suffixIcon: const Icon(
+                        Icons.mic_outlined,
+                        size: 16,
+                        color: Colors.white24,
+                      ),
+                      isDense: true,
+                      contentPadding: const EdgeInsets.symmetric(vertical: 8),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(20),
+                        borderSide: BorderSide(color: Colors.white12),
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(20),
+                        borderSide: BorderSide(color: Colors.white12),
+                      ),
+                    ),
+                    style: const TextStyle(fontSize: 13),
+                    onSubmitted: (query) {
+                      if (query.trim().isNotEmpty) {
+                        onNavigate(
+                          'Search: $query',
+                          SearchResultsView(
+                            query: query,
+                            onNavigate: onNavigate,
+                          ),
+                          Icons.search,
+                        );
+                      }
+                    },
+                  ),
                 ),
               ),
-              style: const TextStyle(fontSize: 13),
-              onSubmitted: (query) {
-                if (query.trim().isNotEmpty) {
-                  onNavigate(
-                    'Search: $query',
-                    SearchResultsView(query: query, onNavigate: onNavigate),
-                    Icons.search,
-                  );
-                }
-              },
             ),
           ),
           const SizedBox(width: 8),
@@ -1207,9 +1405,156 @@ class _AppBar extends StatelessWidget {
           // notifications collection.
           const _NotificationBell(),
           const SizedBox(width: 8),
+          const _ServerSwitcher(),
+          const SizedBox(width: 8),
           // Admin toggle
           _AdminToggle(active: adminMode, onTap: onAdminToggle),
         ],
+      ),
+    );
+  }
+}
+
+/// App-bar server switcher: shows the connected server and lets the operator
+/// hop between saved connections (e.g. production and the nc VM) without
+/// signing out. Credentials live in the saved profiles, so switching never
+/// asks for a token again.
+class _ServerSwitcher extends StatefulWidget {
+  const _ServerSwitcher();
+
+  @override
+  State<_ServerSwitcher> createState() => _ServerSwitcherState();
+}
+
+class _ServerSwitcherState extends State<_ServerSwitcher> {
+  static const _addValue = '__add__';
+  List<ServerProfile> _profiles = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final profiles = await ServerProfileStore().list();
+    if (mounted) setState(() => _profiles = profiles);
+  }
+
+  ServerProfile? get _current {
+    final url = ScrollAPI().objectServerUrl;
+    for (final p in _profiles) {
+      if (p.objectServerUrl == url) return p;
+    }
+    return null;
+  }
+
+  String get _label {
+    final current = _current;
+    if (current != null) return current.name;
+    final uri = Uri.tryParse(ScrollAPI().objectServerUrl ?? '');
+    if (uri == null || uri.host.isEmpty) return 'Server';
+    return uri.hasPort ? '${uri.host}:${uri.port}' : uri.host;
+  }
+
+  Future<void> _select(String value) async {
+    if (value == _addValue) {
+      // Profiles keep their own tokens, so leaving this connection loses
+      // nothing; the Connect screen then offers a new one.
+      ScrollRealtime().shutdown();
+      await ScrollAPI().disconnect();
+      ScrollData().clear();
+      if (!mounted) return;
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const ConnectScreen()),
+        (route) => false,
+      );
+      return;
+    }
+    final profile = _profiles.firstWhere((p) => p.id == value);
+    final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+    final error = await activateProfile(profile);
+    if (error != null) {
+      messenger.showSnackBar(SnackBar(content: Text(error)));
+      return;
+    }
+    navigator.pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const MainShell()),
+      (route) => false,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final currentId = _current?.id;
+    return PopupMenuButton<String>(
+      tooltip: 'Switch server',
+      onOpened: _load,
+      onSelected: _select,
+      itemBuilder: (context) => [
+        for (final p in _profiles)
+          PopupMenuItem<String>(
+            value: p.id,
+            child: Row(
+              children: [
+                Icon(
+                  p.id == currentId
+                      ? Icons.radio_button_checked
+                      : Icons.radio_button_unchecked,
+                  size: 16,
+                ),
+                const SizedBox(width: 8),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(p.name),
+                    Text(
+                      p.objectServerUrl,
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Colors.white38,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        if (_profiles.isNotEmpty) const PopupMenuDivider(),
+        const PopupMenuItem<String>(
+          value: _addValue,
+          child: Row(
+            children: [
+              Icon(Icons.add, size: 16),
+              SizedBox(width: 8),
+              Text('Add connection…'),
+            ],
+          ),
+        ),
+      ],
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          border: Border.all(color: Colors.white12),
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.dns_outlined, size: 14, color: Colors.white54),
+            const SizedBox(width: 6),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 160),
+              child: Text(
+                _label,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 12),
+              ),
+            ),
+            const Icon(Icons.arrow_drop_down, size: 16, color: Colors.white54),
+          ],
+        ),
       ),
     );
   }
@@ -1541,8 +1886,8 @@ class _StatusBar extends StatelessWidget {
               ),
               const Spacer(),
               if (adminMode)
-                const Text(
-                  'Admin Mode',
+                Text(
+                  d.hasAdminStatus ? 'Admin Mode' : 'Admin Mode (locked)',
                   style: TextStyle(
                     fontSize: 11,
                     color: Colors.amber,
@@ -1645,9 +1990,30 @@ class SwitchboardView extends StatelessWidget {
             spacing: 12,
             runSpacing: 12,
             children: [
+              // Real: create in this object server's own apps.
+              if (!ScrollAPI().hasPlatform)
+                for (final c in const [
+                  ('notes', 'New Note', Icons.note_add_outlined, Colors.blue),
+                  ('tasks', 'New Desk Task', Icons.add_task, Colors.green),
+                  (
+                    'projects',
+                    'New Project',
+                    Icons.create_new_folder_outlined,
+                    Colors.orange,
+                  ),
+                ])
+                  _ActionCard(
+                    icon: c.$3,
+                    label: c.$2,
+                    color: c.$4,
+                    onTap: () => createServerRecord(context, c.$1),
+                  ),
               _ActionCard(
                 icon: Icons.person_add,
                 label: 'New Contact',
+                unavailable: ScrollAPI().hasPlatform
+                    ? null
+                    : 'Needs a platform URL (AskRobots) — set one on the Connect screen.',
                 color: Colors.blue,
                 onTap: () {
                   onNavigate?.call(
@@ -1673,6 +2039,9 @@ class SwitchboardView extends StatelessWidget {
               _ActionCard(
                 icon: Icons.add_task,
                 label: 'New Task',
+                unavailable: ScrollAPI().hasPlatform
+                    ? null
+                    : 'Needs a platform URL (AskRobots) — set one on the Connect screen.',
                 color: Colors.green,
                 onTap: () {
                   onNavigate?.call(
@@ -1697,6 +2066,9 @@ class SwitchboardView extends StatelessWidget {
               _ActionCard(
                 icon: Icons.shopping_cart,
                 label: 'New Order',
+                unavailable: ScrollAPI().hasPlatform
+                    ? null
+                    : 'Needs a platform URL (AskRobots) — set one on the Connect screen.',
                 color: Colors.orange,
                 onTap: () {
                   onNavigate?.call(
@@ -1721,11 +2093,15 @@ class SwitchboardView extends StatelessWidget {
               _ActionCard(
                 icon: Icons.receipt_long,
                 label: 'New Invoice',
+                mockup: true,
                 color: Colors.purple,
                 onTap: () {
                   onNavigate?.call(
                     'New Invoice',
-                    const InvoiceFormView(),
+                    const MockupFrame(
+                      what: 'Invoice form',
+                      child: InvoiceFormView(),
+                    ),
                     Icons.receipt_long,
                   );
                 },
@@ -1733,6 +2109,7 @@ class SwitchboardView extends StatelessWidget {
               _ActionCard(
                 icon: Icons.upload_file,
                 label: 'Import Data',
+                mockup: true,
                 color: Colors.teal,
                 onTap: () {},
               ),
@@ -1756,11 +2133,15 @@ class SwitchboardView extends StatelessWidget {
           // Views
           _sectionLabel('VIEWS'),
           const SizedBox(height: 12),
+          if (!ScrollAPI().hasPlatform)
+            ServerCollectionViews(onNavigate: onNavigate),
           _ViewTile(
             icon: Icons.people,
             title: 'Contacts',
-            sub: '${d.contactCount} contacts',
-            count: '${d.contactCount}',
+            sub: ScrollAPI().hasPlatform
+                ? '${d.contactCount} contacts'
+                : 'Needs a platform URL (AskRobots)',
+            count: ScrollAPI().hasPlatform ? '${d.contactCount}' : '—',
             onTap: () {
               onNavigate?.call(
                 'Contacts',
@@ -1790,8 +2171,10 @@ class SwitchboardView extends StatelessWidget {
           _ViewTile(
             icon: Icons.check_circle_outline,
             title: 'My Tasks',
-            sub: '${d.taskCount} tasks',
-            count: '${d.taskCount}',
+            sub: ScrollAPI().hasPlatform
+                ? '${d.taskCount} tasks'
+                : 'Needs a platform URL (AskRobots)',
+            count: ScrollAPI().hasPlatform ? '${d.taskCount}' : '—',
             onTap: () {
               onNavigate?.call(
                 'My Tasks',
@@ -1809,12 +2192,14 @@ class SwitchboardView extends StatelessWidget {
           _ViewTile(
             icon: Icons.shopping_cart,
             title: 'Recent Orders',
+            mockup: true,
             sub: '341 total, 18 this week',
             count: '341',
             onTap: () {
               onNavigate?.call(
                 'Recent Orders',
                 ListView2(
+                  mockup: true,
                   title: 'Orders',
                   columns: const [
                     'Order #',
@@ -1851,6 +2236,7 @@ class SwitchboardView extends StatelessWidget {
           _ViewTile(
             icon: Icons.receipt_long,
             title: 'Invoices',
+            mockup: true,
             sub: '5 unpaid, 2 overdue',
             count: '5',
             alert: true,
@@ -1858,6 +2244,7 @@ class SwitchboardView extends StatelessWidget {
               onNavigate?.call(
                 'Invoices',
                 ListView2(
+                  mockup: true,
                   title: 'Invoices',
                   columns: const [
                     'Invoice #',
@@ -1906,12 +2293,14 @@ class SwitchboardView extends StatelessWidget {
           _ViewTile(
             icon: Icons.inventory_2,
             title: 'Products',
+            mockup: true,
             sub: '89 active products',
             count: '89',
             onTap: () {
               onNavigate?.call(
                 'Products',
                 ListView2(
+                  mockup: true,
                   title: 'Products',
                   columns: const ['Name', 'SKU', 'Price', 'Stock', 'Category'],
                   rows: List.generate(
@@ -1951,8 +2340,10 @@ class SwitchboardView extends StatelessWidget {
           _ViewTile(
             icon: Icons.folder,
             title: 'Projects',
-            sub: '${d.projectCount} projects',
-            count: '${d.projectCount}',
+            sub: ScrollAPI().hasPlatform
+                ? '${d.projectCount} projects'
+                : 'Needs a platform URL (AskRobots)',
+            count: ScrollAPI().hasPlatform ? '${d.projectCount}' : '—',
             onTap: () {
               onNavigate?.call(
                 'Projects',
@@ -1967,6 +2358,19 @@ class SwitchboardView extends StatelessWidget {
               );
             },
           ),
+          _ViewTile(
+            icon: Icons.paid_outlined,
+            title: 'AI Usage',
+            sub: 'Tokens and cost by model and day',
+            count: '—',
+            onTap: () {
+              onNavigate?.call(
+                'AI Usage',
+                const AIUsageView(),
+                Icons.paid_outlined,
+              );
+            },
+          ),
 
           const SizedBox(height: 36),
 
@@ -1978,36 +2382,44 @@ class SwitchboardView extends StatelessWidget {
             runSpacing: 12,
             children: [
               _ReportCard(
+                mockup: true,
                 icon: Icons.trending_up,
                 title: 'Monthly Sales',
                 sub: 'By region, subtotaled',
                 onTap: () {
                   onNavigate?.call(
                     'Monthly Sales Report',
-                    const ReportView(),
+                    const MockupFrame(
+                      what: 'Monthly sales report',
+                      child: ReportView(),
+                    ),
                     Icons.assessment,
                   );
                 },
               ),
               _ReportCard(
+                mockup: true,
                 icon: Icons.people_outline,
                 title: 'Customer List',
                 sub: 'With contact info',
                 onTap: () {},
               ),
               _ReportCard(
+                mockup: true,
                 icon: Icons.warning_amber,
                 title: 'Overdue Invoices',
                 sub: 'Grouped by customer',
                 onTap: () {},
               ),
               _ReportCard(
+                mockup: true,
                 icon: Icons.inventory,
                 title: 'Inventory Report',
                 sub: 'Stock levels & reorder',
                 onTap: () {},
               ),
               _ReportCard(
+                mockup: true,
                 icon: Icons.label_outline,
                 title: 'Shipping Labels',
                 sub: 'Avery 5160 format',
@@ -2097,7 +2509,10 @@ class _OperatorStatusPanel extends StatelessWidget {
               _metric(
                 Icons.inventory_2_outlined,
                 'Objects',
-                _countText(data.inventoryCount('objects') ?? data.objectCount),
+                _countText(
+                  data.inventoryCount('objects') ??
+                      (data.hasAdminStatus ? data.objectCount : null),
+                ),
                 Colors.blue,
               ),
               _metric(
@@ -2357,7 +2772,8 @@ class _OperatorStatusPanel extends StatelessWidget {
     );
   }
 
-  String _countText(int? value) => value == null ? '?' : value.toString();
+  String _countText(int? value) =>
+      value == null ? (data.hasAdminStatus ? '?' : 'locked') : value.toString();
 
   String _valueLabel(dynamic value) {
     if (value is bool) return value ? 'on' : 'off';
@@ -2397,17 +2813,37 @@ class _ActionCard extends StatelessWidget {
   final String label;
   final Color color;
   final VoidCallback onTap;
+  final bool mockup;
+
+  /// Set when the action exists but can't run on this connection: shown
+  /// grey (unavailable), with the reason. Different from [mockup] (pink).
+  final String? unavailable;
   const _ActionCard({
     required this.icon,
     required this.label,
-    required this.color,
+    required Color color,
     required this.onTap,
-  });
+    this.mockup = false,
+    this.unavailable,
+  }) : color = unavailable == null ? color : Colors.white38;
 
   @override
   Widget build(BuildContext context) {
+    final card = mockup
+        ? MockupOutline(radius: 12, child: _card(context))
+        : _card(context);
+    return unavailable == null
+        ? card
+        : Tooltip(message: unavailable!, child: card);
+  }
+
+  Widget _card(BuildContext context) {
     return InkWell(
-      onTap: onTap,
+      onTap: unavailable == null
+          ? onTap
+          : () => ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text(unavailable!))),
       borderRadius: BorderRadius.circular(12),
       child: Container(
         width: 140,
@@ -2437,6 +2873,7 @@ class _ViewTile extends StatelessWidget {
   final String count;
   final bool alert;
   final VoidCallback onTap;
+  final bool mockup;
   const _ViewTile({
     required this.icon,
     required this.title,
@@ -2444,10 +2881,19 @@ class _ViewTile extends StatelessWidget {
     required this.count,
     this.alert = false,
     required this.onTap,
+    this.mockup = false,
   });
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => mockup
+      ? Padding(
+          // Room above for the tag that sits on the border.
+          padding: const EdgeInsets.only(top: 10, bottom: 4),
+          child: MockupOutline(radius: 8, child: _tile(context)),
+        )
+      : _tile(context);
+
+  Widget _tile(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 2),
       child: ListTile(
@@ -2476,60 +2922,6 @@ class _ViewTile extends StatelessWidget {
           ),
         ),
         onTap: onTap,
-      ),
-    );
-  }
-}
-
-class _ReportCard extends StatelessWidget {
-  final IconData icon;
-  final String title;
-  final String sub;
-  final VoidCallback onTap;
-  const _ReportCard({
-    required this.icon,
-    required this.title,
-    required this.sub,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(12),
-      child: Container(
-        width: 200,
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: Theme.of(context).colorScheme.surfaceContainerLow,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.white10),
-        ),
-        child: Row(
-          children: [
-            Icon(icon, size: 24, color: Colors.white38),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: const TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                  Text(
-                    sub,
-                    style: TextStyle(fontSize: 11, color: Colors.white38),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
       ),
     );
   }
@@ -2911,233 +3303,6 @@ class _FormViewState extends State<FormView> {
         labelText: label,
         border: const OutlineInputBorder(),
       ),
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// List View — data grid accessed from switchboard
-// ---------------------------------------------------------------------------
-
-class ListView2 extends StatefulWidget {
-  final String title;
-  final List<String> columns;
-  final List<List<String>> rows;
-  final void Function(String, Widget, [IconData])? onNavigate;
-  const ListView2({
-    super.key,
-    required this.title,
-    required this.columns,
-    required this.rows,
-    this.onNavigate,
-  });
-
-  @override
-  State<ListView2> createState() => _ListView2State();
-}
-
-class _ListView2State extends State<ListView2> {
-  int? _selectedRow;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: [
-        // Toolbar
-        Container(
-          height: 44,
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          decoration: BoxDecoration(
-            border: Border(bottom: BorderSide(color: Colors.white10)),
-          ),
-          child: Row(
-            children: [
-              Text(
-                '${widget.rows.length} records',
-                style: TextStyle(fontSize: 13, color: Colors.white38),
-              ),
-              const Spacer(),
-              SizedBox(
-                width: 200,
-                height: 32,
-                child: TextField(
-                  decoration: InputDecoration(
-                    hintText: 'Search ${widget.title.toLowerCase()}...',
-                    hintStyle: const TextStyle(fontSize: 12),
-                    prefixIcon: const Icon(Icons.search, size: 16),
-                    isDense: true,
-                    contentPadding: const EdgeInsets.symmetric(vertical: 6),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                  ),
-                  style: const TextStyle(fontSize: 12),
-                ),
-              ),
-              const SizedBox(width: 8),
-              IconButton(
-                onPressed: () {},
-                icon: const Icon(Icons.filter_list, size: 18),
-                tooltip: 'Filter',
-                visualDensity: VisualDensity.compact,
-              ),
-              IconButton(
-                onPressed: () {},
-                icon: const Icon(Icons.sort, size: 18),
-                tooltip: 'Sort',
-                visualDensity: VisualDensity.compact,
-              ),
-              const SizedBox(width: 8),
-              SegmentedButton<String>(
-                segments: const [
-                  ButtonSegment(
-                    value: 'grid',
-                    icon: Icon(Icons.view_list, size: 16),
-                  ),
-                  ButtonSegment(
-                    value: 'form',
-                    icon: Icon(Icons.dynamic_form, size: 16),
-                  ),
-                ],
-                selected: const {'grid'},
-                onSelectionChanged: (_) {},
-                style: ButtonStyle(
-                  visualDensity: VisualDensity.compact,
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-              ),
-              const SizedBox(width: 8),
-              FilledButton.icon(
-                onPressed: () {},
-                icon: const Icon(Icons.add, size: 16),
-                label: const Text('New', style: TextStyle(fontSize: 12)),
-                style: FilledButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  visualDensity: VisualDensity.compact,
-                ),
-              ),
-            ],
-          ),
-        ),
-        // Grid
-        Expanded(
-          child: SingleChildScrollView(
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: DataTable(
-                headingRowHeight: 36,
-                dataRowMinHeight: 36,
-                dataRowMaxHeight: 36,
-                columnSpacing: 32,
-                headingTextStyle: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white54,
-                ),
-                dataTextStyle: const TextStyle(fontSize: 13),
-                columns: widget.columns
-                    .map((c) => DataColumn(label: Text(c)))
-                    .toList(),
-                rows: widget.rows.asMap().entries.map((entry) {
-                  final i = entry.key;
-                  final row = entry.value;
-                  return DataRow(
-                    selected: _selectedRow == i,
-                    onSelectChanged: (_) {
-                      if (_selectedRow == i && widget.onNavigate != null) {
-                        // Double-click / re-click opens detail
-                        final record = Map.fromIterables(widget.columns, row);
-                        widget.onNavigate!(
-                          '${row[0]}',
-                          RecordDetailView(
-                            title: row.length > 1 ? row[0] : 'Record',
-                            collection: widget.title,
-                            fields: record,
-                            onNavigate: widget.onNavigate,
-                          ),
-                          Icons.article,
-                        );
-                      }
-                      setState(() => _selectedRow = i);
-                    },
-                    cells: row.map((cell) {
-                      if ([
-                        'hot',
-                        'warm',
-                        'cold',
-                        'customer',
-                        'high',
-                        'critical',
-                        'low',
-                        'normal',
-                        'open',
-                        'in_progress',
-                        'active',
-                        'draft',
-                      ].contains(cell)) {
-                        return DataCell(_chip(cell));
-                      }
-                      if (cell == 'today') {
-                        return DataCell(
-                          Text(
-                            cell,
-                            style: TextStyle(
-                              color: Colors.red[300],
-                              fontWeight: FontWeight.bold,
-                              fontSize: 13,
-                            ),
-                          ),
-                        );
-                      }
-                      return DataCell(Text(cell));
-                    }).toList(),
-                  );
-                }).toList(),
-              ),
-            ),
-          ),
-        ),
-        // Pagination
-        Container(
-          height: 36,
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          decoration: BoxDecoration(
-            border: Border(top: BorderSide(color: Colors.white10)),
-          ),
-          child: Row(
-            children: [
-              Text(
-                'Page 1 of 1',
-                style: TextStyle(fontSize: 12, color: Colors.white38),
-              ),
-              const Spacer(),
-              Text(
-                'Showing 1-${widget.rows.length} of ${widget.rows.length}',
-                style: TextStyle(fontSize: 12, color: Colors.white38),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _chip(String value) {
-    final color = switch (value) {
-      'hot' || 'critical' || 'overdue' => Colors.red,
-      'warm' || 'high' || 'in_progress' => Colors.orange,
-      'customer' || 'active' => Colors.green,
-      'cold' || 'low' || 'draft' => Colors.grey,
-      'open' || 'normal' => Colors.blue,
-      _ => Colors.white54,
-    };
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.12),
-        borderRadius: BorderRadius.circular(4),
-      ),
-      child: Text(value, style: TextStyle(fontSize: 11, color: color)),
     );
   }
 }
@@ -3686,95 +3851,131 @@ class _RecordDetailViewState extends State<RecordDetailView> {
 
               const SizedBox(height: 16),
 
-              // Related data
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surfaceContainerLow,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.white10),
-                ),
+              // Mockup: related records and ownership are planned, not built.
+              MockupOutline(
+                radius: 12,
                 child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Text(
-                      'RELATED DATA',
-                      style: TextStyle(
-                        fontSize: 10,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white38,
-                        letterSpacing: 1,
+                    // Related data
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Theme.of(
+                          context,
+                        ).colorScheme.surfaceContainerLow,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: Colors.white10),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'RELATED DATA',
+                            style: TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white38,
+                              letterSpacing: 1,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          if (collection == 'Contacts') ...[
+                            _relatedTile(
+                              Icons.receipt_long,
+                              'Invoices',
+                              '3 invoices (\$4,200 total)',
+                            ),
+                            _relatedTile(
+                              Icons.shopping_cart,
+                              'Orders',
+                              '7 orders this year',
+                            ),
+                            _relatedTile(Icons.note, 'Notes', '2 notes'),
+                            _relatedTile(
+                              Icons.attach_file,
+                              'Files',
+                              '1 attachment',
+                            ),
+                          ] else if (collection == 'Orders') ...[
+                            _relatedTile(
+                              Icons.person,
+                              'Customer',
+                              'Acme Corp — Alice Chen',
+                            ),
+                            _relatedTile(
+                              Icons.inventory_2,
+                              'Items',
+                              '3 line items',
+                            ),
+                            _relatedTile(
+                              Icons.receipt_long,
+                              'Invoice',
+                              'INV-1043 (draft)',
+                            ),
+                          ] else ...[
+                            _relatedTile(
+                              Icons.link,
+                              'Related Records',
+                              'Click to load related data',
+                            ),
+                          ],
+                        ],
                       ),
                     ),
-                    const SizedBox(height: 12),
-                    if (collection == 'Contacts') ...[
-                      _relatedTile(
-                        Icons.receipt_long,
-                        'Invoices',
-                        '3 invoices (\$4,200 total)',
-                      ),
-                      _relatedTile(
-                        Icons.shopping_cart,
-                        'Orders',
-                        '7 orders this year',
-                      ),
-                      _relatedTile(Icons.note, 'Notes', '2 notes'),
-                      _relatedTile(Icons.attach_file, 'Files', '1 attachment'),
-                    ] else if (collection == 'Orders') ...[
-                      _relatedTile(
-                        Icons.person,
-                        'Customer',
-                        'Acme Corp — Alice Chen',
-                      ),
-                      _relatedTile(Icons.inventory_2, 'Items', '3 line items'),
-                      _relatedTile(
-                        Icons.receipt_long,
-                        'Invoice',
-                        'INV-1043 (draft)',
-                      ),
-                    ] else ...[
-                      _relatedTile(
-                        Icons.link,
-                        'Related Records',
-                        'Click to load related data',
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-              const SizedBox(height: 16),
+                    const SizedBox(height: 16),
 
-              // Ownership
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.03),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.white10),
-                ),
-                child: Row(
-                  children: [
-                    Icon(Icons.person_outline, size: 16, color: Colors.white38),
-                    const SizedBox(width: 8),
-                    Text(
-                      'Owner: admin',
-                      style: TextStyle(fontSize: 12, color: Colors.white38),
+                    // Ownership
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.03),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.white10),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.person_outline,
+                            size: 16,
+                            color: Colors.white38,
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            'Owner: admin',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.white38,
+                            ),
+                          ),
+                          const SizedBox(width: 16),
+                          Text(
+                            'Created: 2026-04-05',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.white24,
+                            ),
+                          ),
+                          const SizedBox(width: 16),
+                          Text(
+                            'Modified: 2026-04-08',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.white24,
+                            ),
+                          ),
+                          const Spacer(),
+                          Text(
+                            'ROLE-BASED',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.orange,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                    const SizedBox(width: 16),
-                    Text(
-                      'Created: 2026-04-05',
-                      style: TextStyle(fontSize: 12, color: Colors.white24),
-                    ),
-                    const SizedBox(width: 16),
-                    Text(
-                      'Modified: 2026-04-08',
-                      style: TextStyle(fontSize: 12, color: Colors.white24),
-                    ),
-                    const Spacer(),
-                    Text(
-                      'ROLE-BASED',
-                      style: TextStyle(fontSize: 12, color: Colors.orange),
-                    ),
+                    const SizedBox(height: 20),
                   ],
                 ),
               ),
@@ -3833,6 +4034,36 @@ class _RecordDetailViewState extends State<RecordDetailView> {
                   ),
                 ],
               ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _relatedTile(IconData icon, String label, String detail) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: InkWell(
+        onTap: () {},
+        borderRadius: BorderRadius.circular(6),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
+          child: Row(
+            children: [
+              Icon(icon, size: 16, color: Colors.white38),
+              const SizedBox(width: 10),
+              Text(
+                label,
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                detail,
+                style: TextStyle(fontSize: 12, color: Colors.white38),
+              ),
+              const Spacer(),
+              Icon(Icons.chevron_right, size: 16, color: Colors.white24),
             ],
           ),
         ),
@@ -3919,211 +4150,6 @@ class _RecordDetailViewState extends State<RecordDetailView> {
       return 'currency';
     if (key.contains('status') || key.contains('Status')) return 'enum';
     return 'text';
-  }
-
-  Widget _relatedTile(IconData icon, String label, String detail) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: InkWell(
-        onTap: () {},
-        borderRadius: BorderRadius.circular(6),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
-          child: Row(
-            children: [
-              Icon(icon, size: 16, color: Colors.white38),
-              const SizedBox(width: 10),
-              Text(
-                label,
-                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
-              ),
-              const SizedBox(width: 8),
-              Text(
-                detail,
-                style: TextStyle(fontSize: 12, color: Colors.white38),
-              ),
-              const Spacer(),
-              Icon(Icons.chevron_right, size: 16, color: Colors.white24),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Report View
-// ---------------------------------------------------------------------------
-
-class ReportView extends StatelessWidget {
-  const ReportView({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(32),
-      child: Center(
-        child: Container(
-          constraints: const BoxConstraints(maxWidth: 800),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // Report header
-              Row(
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Monthly Sales Report',
-                          style: Theme.of(context).textTheme.titleLarge,
-                        ),
-                        Text(
-                          'April 2026 — Grouped by Region',
-                          style: TextStyle(fontSize: 13, color: Colors.white38),
-                        ),
-                      ],
-                    ),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: () {},
-                    icon: const Icon(Icons.picture_as_pdf, size: 16),
-                    label: const Text('Export PDF'),
-                  ),
-                  const SizedBox(width: 8),
-                  OutlinedButton.icon(
-                    onPressed: () {},
-                    icon: const Icon(Icons.print, size: 16),
-                    label: const Text('Print'),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 24),
-
-              // Report groups
-              _reportGroup(context, 'West Region', [
-                ['Acme Corp', '42', '\$12,600'],
-                ['TechStart', '28', '\$8,400'],
-                ['CloudNine', '15', '\$4,500'],
-              ], '\$25,500'),
-
-              _reportGroup(context, 'East Region', [
-                ['DataFlow', '38', '\$11,400'],
-                ['NetWorks', '22', '\$6,600'],
-                ['ByteSize', '19', '\$5,700'],
-              ], '\$23,700'),
-
-              _reportGroup(context, 'Central Region', [
-                ['MidTech', '31', '\$9,300'],
-                ['CoreData', '17', '\$5,100'],
-              ], '\$14,400'),
-
-              const SizedBox(height: 8),
-              const Divider(thickness: 2),
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                child: Row(
-                  children: [
-                    Text(
-                      'GRAND TOTAL',
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white,
-                      ),
-                    ),
-                    const Spacer(),
-                    Text(
-                      '\$63,600',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.green[300],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _reportGroup(
-    BuildContext context,
-    String region,
-    List<List<String>> rows,
-    String subtotal,
-  ) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Container(
-          width: double.infinity,
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          decoration: BoxDecoration(
-            color: Theme.of(
-              context,
-            ).colorScheme.primaryContainer.withOpacity(0.15),
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: Text(
-            region,
-            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
-          ),
-        ),
-        const SizedBox(height: 4),
-        ...rows.map(
-          (row) => Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            child: Row(
-              children: [
-                Expanded(
-                  flex: 3,
-                  child: Text(row[0], style: const TextStyle(fontSize: 13)),
-                ),
-                Expanded(
-                  child: Text(
-                    '${row[1]} units',
-                    style: TextStyle(fontSize: 13, color: Colors.white54),
-                  ),
-                ),
-                SizedBox(
-                  width: 100,
-                  child: Text(
-                    row[2],
-                    textAlign: TextAlign.right,
-                    style: const TextStyle(fontSize: 13),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-          child: Row(
-            children: [
-              const Spacer(),
-              Text(
-                'Subtotal: $subtotal',
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white70,
-                ),
-              ),
-            ],
-          ),
-        ),
-        const Divider(),
-        const SizedBox(height: 8),
-      ],
-    );
   }
 }
 
@@ -4988,7 +5014,12 @@ class _DaemonStatusViewState extends State<DaemonStatusView> {
     final scheduler = data.daemonSection('scheduler');
     final queue = data.daemonSection('queue');
     final events = data.daemonSection('events');
-    final subscriptions = data.daemonSection('subscriptions');
+    // The server nests subscriptions under events.
+    final subscriptions = data.daemonSection('subscriptions').isNotEmpty
+        ? data.daemonSection('subscriptions')
+        : (events['subscriptions'] is Map
+              ? Map<String, dynamic>.from(events['subscriptions'] as Map)
+              : const <String, dynamic>{});
     final retention = data.daemonSection('retention');
     final rateLimit = data.daemonSection('rate_limit');
     final schedulerTasks = data.daemonSchedulerTasks;
@@ -5108,6 +5139,7 @@ class _DaemonStatusViewState extends State<DaemonStatusView> {
                       'subscription_count',
                       'subscriptions',
                       'total_subscriptions',
+                      'total',
                       'count',
                     ]),
                   ),
@@ -6579,6 +6611,12 @@ class _DaemonStatusViewState extends State<DaemonStatusView> {
         if (parsed != null) return parsed;
       }
       if (value is Map) {
+        // A summary like {total, valid, invalid}: the total is the count
+        // (summing its numbers would double-count).
+        for (final k in const ['total', 'count']) {
+          final t = value[k];
+          if (t is num) return t.toInt();
+        }
         var total = 0;
         var found = false;
         for (final item in value.values) {
@@ -7034,7 +7072,9 @@ class _ObjectWorkspaceState extends State<ObjectWorkspace> {
         Container(width: 1, color: Colors.white10),
         // Object detail
         Expanded(
-          child: _selectedObject == null
+          child: _selectedObject == null && ScrollAPI().adminLocked.value
+              ? const LockedNotice(what: 'objects')
+              : _selectedObject == null
               ? Center(
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
@@ -8275,7 +8315,13 @@ class _CollectionBrowserState extends State<CollectionBrowser> {
           collections.any((item) => _collectionName(item) == current)
           ? current
           : (collections.isNotEmpty
-                ? _collectionName(collections.first)
+                // Open on a real record collection, not an object namespace.
+                ? _collectionName(
+                    collections.firstWhere(
+                      (c) => c['has_records'] == true,
+                      orElse: () => collections.first,
+                    ),
+                  )
                 : null);
       if (!mounted) return;
       setState(() {
@@ -8493,7 +8539,14 @@ class _CollectionBrowserState extends State<CollectionBrowser> {
     final ok = await _runRecordWrite(
       () => ScrollAPI().createAdminCollectionRecord(collection, written),
     );
-    final id = _recordId(written);
+    // Select the record the server actually created: the id is normally
+    // server-generated, so the submitted form usually has none.
+    final body = _writeResponse?['body'];
+    final created = body is Map && body['record'] is Map
+        ? Map<String, dynamic>.from(body['record'] as Map)
+        : const <String, dynamic>{};
+    final serverId = _recordId(created);
+    final id = serverId.isNotEmpty ? serverId : _recordId(written);
     if (ok && id.isNotEmpty && mounted) await _selectRecord({'id': id});
   }
 
@@ -8671,6 +8724,9 @@ class _CollectionBrowserState extends State<CollectionBrowser> {
   Widget _buildDetail(BuildContext context) {
     final collection = _selectedCollection;
     if (collection == null) {
+      if (ScrollAPI().adminLocked.value) {
+        return const LockedNotice(what: 'collections');
+      }
       return Center(
         child: Text('No collections', style: TextStyle(color: Colors.white38)),
       );
@@ -9397,15 +9453,25 @@ class _CollectionBrowserState extends State<CollectionBrowser> {
             children: [
               Icon(icon, size: 18, color: color),
               const SizedBox(width: 8),
-              Text(
-                title,
-                style: const TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
+              // Narrow windows: title truncates, actions shrink (no overflow).
+              Expanded(
+                child: Text(
+                  title,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
-              const Spacer(),
-              if (trailing != null) trailing,
+              if (trailing != null)
+                Flexible(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerRight,
+                    child: trailing,
+                  ),
+                ),
             ],
           ),
           const SizedBox(height: 12),
@@ -10234,576 +10300,6 @@ class _ProbeCrudPanelState extends State<ProbeCrudPanel> {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Invoice Form — sub-data, permissions, the real test
-// ---------------------------------------------------------------------------
-
-class InvoiceFormView extends StatelessWidget {
-  const InvoiceFormView({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(32),
-      child: Center(
-        child: Container(
-          constraints: const BoxConstraints(maxWidth: 750),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // Header
-              Row(
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Invoice #1043',
-                          style: Theme.of(context).textTheme.titleLarge,
-                        ),
-                        Text(
-                          'Draft — not yet sent',
-                          style: TextStyle(fontSize: 13, color: Colors.orange),
-                        ),
-                      ],
-                    ),
-                  ),
-                  Row(
-                    children: [
-                      IconButton(
-                        onPressed: () {},
-                        icon: const Icon(Icons.chevron_left, size: 20),
-                        tooltip: 'Previous',
-                        visualDensity: VisualDensity.compact,
-                      ),
-                      const Text(
-                        '#1043',
-                        style: TextStyle(fontSize: 12, color: Colors.white38),
-                      ),
-                      IconButton(
-                        onPressed: () {},
-                        icon: const Icon(Icons.chevron_right, size: 20),
-                        tooltip: 'Next',
-                        visualDensity: VisualDensity.compact,
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-              const SizedBox(height: 20),
-
-              // Customer section — auto-loaded sub-data
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surfaceContainerLow,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.white10),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Text(
-                          'CUSTOMER',
-                          style: TextStyle(
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold,
-                            color: Colors.white38,
-                            letterSpacing: 1,
-                          ),
-                        ),
-                        const Spacer(),
-                        Text(
-                          'auto-loaded from contacts',
-                          style: TextStyle(
-                            fontSize: 10,
-                            color: Colors.blue,
-                            fontStyle: FontStyle.italic,
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: DropdownButtonFormField<String>(
-                            decoration: const InputDecoration(
-                              labelText: 'Customer',
-                              border: OutlineInputBorder(),
-                              isDense: true,
-                            ),
-                            value: 'Acme Corp',
-                            items:
-                                [
-                                      'Acme Corp',
-                                      'TechStart',
-                                      'DataFlow',
-                                      'CloudNine',
-                                    ]
-                                    .map(
-                                      (v) => DropdownMenuItem(
-                                        value: v,
-                                        child: Text(v),
-                                      ),
-                                    )
-                                    .toList(),
-                            onChanged: (_) {},
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    // Auto-loaded customer details
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.blue.withOpacity(0.05),
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(
-                          color: Colors.blue.withOpacity(0.15),
-                        ),
-                      ),
-                      child: Column(
-                        children: [
-                          _subDataRow(
-                            'Contact',
-                            'Alice Chen — alice@acmecorp.com',
-                          ),
-                          _subDataRow(
-                            'Address',
-                            '123 Business Ave, Houston TX 77002',
-                          ),
-                          _subDataRow('Payment Terms', 'Net 30'),
-                          _subDataRow('Outstanding', '\$4,200 (2 invoices)'),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 16),
-
-              // Invoice details
-              Row(
-                children: [
-                  Expanded(
-                    child: AdminFieldOverlay(
-                      fieldName: 'Invoice Date',
-                      fieldType: 'date',
-                      required: true,
-                      child: TextField(
-                        decoration: const InputDecoration(
-                          labelText: 'Invoice Date',
-                          border: OutlineInputBorder(),
-                          suffixIcon: Icon(Icons.calendar_today, size: 18),
-                        ),
-                        controller: TextEditingController(text: '2026-04-08'),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: AdminFieldOverlay(
-                      fieldName: 'Due Date',
-                      fieldType: 'date',
-                      required: true,
-                      child: TextField(
-                        decoration: const InputDecoration(
-                          labelText: 'Due Date',
-                          border: OutlineInputBorder(),
-                          suffixIcon: Icon(Icons.calendar_today, size: 18),
-                        ),
-                        controller: TextEditingController(text: '2026-05-08'),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: AdminFieldOverlay(
-                      fieldName: 'Status',
-                      fieldType: 'dropdown',
-                      child: DropdownButtonFormField<String>(
-                        decoration: const InputDecoration(
-                          labelText: 'Status',
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                        ),
-                        value: 'draft',
-                        items: ['draft', 'sent', 'paid', 'overdue', 'cancelled']
-                            .map(
-                              (v) => DropdownMenuItem(value: v, child: Text(v)),
-                            )
-                            .toList(),
-                        onChanged: (_) {},
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 20),
-
-              // Line items — sub-data table
-              AdminFieldOverlay(
-                fieldName: 'Line Items',
-                fieldType: 'sub_table',
-                rolePermissions: const {'sales': 'edit'},
-                child: Column(
-                  children: [
-                    Row(
-                      children: [
-                        Text(
-                          'LINE ITEMS',
-                          style: TextStyle(
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold,
-                            color: Colors.white38,
-                            letterSpacing: 1,
-                          ),
-                        ),
-                        const Spacer(),
-                        TextButton.icon(
-                          onPressed: () {},
-                          icon: const Icon(Icons.add, size: 16),
-                          label: const Text(
-                            'Add Line',
-                            style: TextStyle(fontSize: 12),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Container(
-                      decoration: BoxDecoration(
-                        border: Border.all(color: Colors.white10),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: DataTable(
-                        headingRowHeight: 36,
-                        dataRowMinHeight: 40,
-                        dataRowMaxHeight: 40,
-                        columnSpacing: 16,
-                        headingTextStyle: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white54,
-                        ),
-                        dataTextStyle: const TextStyle(fontSize: 13),
-                        columns: const [
-                          DataColumn(label: Text('Product')),
-                          DataColumn(label: Text('Description')),
-                          DataColumn(label: Text('Qty'), numeric: true),
-                          DataColumn(label: Text('Unit Price'), numeric: true),
-                          DataColumn(label: Text('Total'), numeric: true),
-                          DataColumn(label: Text('')),
-                        ],
-                        rows: [
-                          _lineItem(
-                            'Web Hosting',
-                            'Annual plan — Pro tier',
-                            1,
-                            299.00,
-                          ),
-                          _lineItem(
-                            'SSL Certificate',
-                            'Wildcard, 1 year',
-                            2,
-                            79.00,
-                          ),
-                          _lineItem(
-                            'Support Hours',
-                            'Priority support block',
-                            10,
-                            150.00,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-              // Totals
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surfaceContainerLow,
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Column(
-                  children: [
-                    _totalRow('Subtotal', '\$1,957.00'),
-                    _totalRow('Tax (8.25%)', '\$161.45'),
-                    const Divider(),
-                    _totalRow('Total', '\$2,118.45', bold: true, large: true),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 16),
-
-              // Notes
-              AdminFieldOverlay(
-                fieldName: 'Notes',
-                fieldType: 'textarea',
-                rolePermissions: const {'sales': 'read'},
-                child: TextField(
-                  maxLines: 2,
-                  decoration: const InputDecoration(
-                    labelText: 'Notes',
-                    border: OutlineInputBorder(),
-                    alignLabelWithHint: true,
-                  ),
-                  controller: TextEditingController(
-                    text:
-                        'Payment due within 30 days. Thank you for your business.',
-                  ),
-                ),
-              ),
-              const SizedBox(height: 12),
-
-              // Ownership & permissions
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.03),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.white10),
-                ),
-                child: Column(
-                  children: [
-                    Row(
-                      children: [
-                        Icon(
-                          Icons.person_outline,
-                          size: 16,
-                          color: Colors.white38,
-                        ),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Owner: you',
-                          style: TextStyle(fontSize: 12, color: Colors.white38),
-                        ),
-                        const Spacer(),
-                        Text(
-                          'Access: ROLE-BASED',
-                          style: TextStyle(fontSize: 12, color: Colors.orange),
-                        ),
-                      ],
-                    ),
-                    const Divider(height: 16),
-                    Row(
-                      children: [
-                        Icon(Icons.visibility, size: 14, color: Colors.white24),
-                        const SizedBox(width: 6),
-                        Text(
-                          'Field Permissions (your role: admin)',
-                          style: TextStyle(fontSize: 11, color: Colors.white38),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 6,
-                      runSpacing: 4,
-                      children: [
-                        _permChip('Customer', true, true),
-                        _permChip('Dates', true, true),
-                        _permChip('Line Items', true, true),
-                        _permChip('Totals', true, false),
-                        _permChip('Notes', true, true),
-                        _permChip('Status', true, true),
-                        _permChip('Cost Price', false, false),
-                        _permChip('Margin', false, false),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Icon(
-                          Icons.info_outline,
-                          size: 13,
-                          color: Colors.white24,
-                        ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Text(
-                            '"sales" role cannot see Cost Price or Margin fields. Totals are read-only for non-admin.',
-                            style: TextStyle(
-                              fontSize: 11,
-                              color: Colors.white30,
-                              fontStyle: FontStyle.italic,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-
-              const SizedBox(height: 24),
-
-              // Actions
-              Row(
-                children: [
-                  FilledButton.icon(
-                    onPressed: () {},
-                    icon: const Icon(Icons.save, size: 18),
-                    label: const Text('Save'),
-                  ),
-                  const SizedBox(width: 8),
-                  OutlinedButton.icon(
-                    onPressed: () {},
-                    icon: const Icon(Icons.send, size: 16),
-                    label: const Text('Save & Send'),
-                  ),
-                  const SizedBox(width: 8),
-                  OutlinedButton.icon(
-                    onPressed: () {},
-                    icon: const Icon(Icons.picture_as_pdf, size: 16),
-                    label: const Text('PDF'),
-                  ),
-                  const SizedBox(width: 8),
-                  OutlinedButton.icon(
-                    onPressed: () {},
-                    icon: const Icon(Icons.print, size: 16),
-                    label: const Text('Print'),
-                  ),
-                  const Spacer(),
-                  TextButton.icon(
-                    onPressed: () {},
-                    icon: const Icon(
-                      Icons.auto_awesome,
-                      size: 16,
-                      color: Colors.amber,
-                    ),
-                    label: const Text(
-                      'AI Fill',
-                      style: TextStyle(color: Colors.amber),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  DataRow _lineItem(String product, String desc, int qty, double price) {
-    return DataRow(
-      cells: [
-        DataCell(Text(product)),
-        DataCell(
-          Text(desc, style: TextStyle(color: Colors.white54, fontSize: 12)),
-        ),
-        DataCell(Text('$qty')),
-        DataCell(Text('\$${price.toStringAsFixed(2)}')),
-        DataCell(
-          Text(
-            '\$${(qty * price).toStringAsFixed(2)}',
-            style: TextStyle(fontWeight: FontWeight.bold),
-          ),
-        ),
-        DataCell(
-          IconButton(
-            onPressed: () {},
-            icon: const Icon(Icons.close, size: 14),
-            visualDensity: VisualDensity.compact,
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _subDataRow(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 110,
-            child: Text(
-              label,
-              style: TextStyle(fontSize: 12, color: Colors.white38),
-            ),
-          ),
-          Expanded(child: Text(value, style: const TextStyle(fontSize: 13))),
-        ],
-      ),
-    );
-  }
-
-  Widget _totalRow(
-    String label,
-    String value, {
-    bool bold = false,
-    bool large = false,
-  }) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2),
-      child: Row(
-        children: [
-          Text(
-            label,
-            style: TextStyle(
-              fontSize: large ? 15 : 13,
-              fontWeight: bold ? FontWeight.bold : FontWeight.normal,
-            ),
-          ),
-          const Spacer(),
-          Text(
-            value,
-            style: TextStyle(
-              fontSize: large ? 18 : 13,
-              fontWeight: bold ? FontWeight.bold : FontWeight.normal,
-              color: bold ? Colors.green[300] : null,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _permChip(String field, bool canView, bool canEdit) {
-    final color = !canView
-        ? Colors.red
-        : (canEdit ? Colors.green : Colors.orange);
-    final label = !canView ? 'hidden' : (canEdit ? 'edit' : 'read');
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(4),
-        border: Border.all(color: color.withOpacity(0.3)),
-      ),
-      child: Text.rich(
-        TextSpan(
-          children: [
-            TextSpan(
-              text: '$field ',
-              style: TextStyle(fontSize: 11, color: Colors.white70),
-            ),
-            TextSpan(
-              text: label,
-              style: TextStyle(
-                fontSize: 10,
-                color: color,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Placeholder
 // ---------------------------------------------------------------------------
 
@@ -10853,7 +10349,15 @@ class _SchemaEditorViewState extends State<SchemaEditorView> {
       final current = _selectedSchema;
       final selected = schemas.any((item) => _schemaName(item) == current)
           ? current
-          : (schemas.isNotEmpty ? _schemaName(schemas.first) : null);
+          : (schemas.isNotEmpty
+                // Open on a schema that has fields (namespaces have none).
+                ? _schemaName(
+                    schemas.firstWhere(
+                      (s) => (s['field_count'] as num? ?? 1) > 0,
+                      orElse: () => schemas.first,
+                    ),
+                  )
+                : null);
       if (!mounted) return;
       setState(() {
         _schemas = schemas;
@@ -11211,6 +10715,9 @@ class _SchemaEditorViewState extends State<SchemaEditorView> {
   Widget _buildDetail(BuildContext context) {
     final schema = _selectedSchema;
     if (schema == null) {
+      if (ScrollAPI().adminLocked.value) {
+        return const LockedNotice(what: 'schemas');
+      }
       return Center(
         child: Text('No schemas', style: TextStyle(color: Colors.white38)),
       );
@@ -11754,15 +11261,25 @@ class _SchemaEditorViewState extends State<SchemaEditorView> {
             children: [
               Icon(icon, size: 18, color: color),
               const SizedBox(width: 8),
-              Text(
-                title,
-                style: const TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
+              // Narrow windows: title truncates, actions shrink (no overflow).
+              Expanded(
+                child: Text(
+                  title,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
-              const Spacer(),
-              if (trailing != null) trailing,
+              if (trailing != null)
+                Flexible(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerRight,
+                    child: trailing,
+                  ),
+                ),
             ],
           ),
           const SizedBox(height: 12),
@@ -12140,7 +11657,7 @@ class _PackageManagerViewState extends State<PackageManagerView> {
         SnackBar(
           content: Text(
             '${isUpgrade ? 'Upgrade' : 'Install'} failed: '
-            'HTTP ${code ?? result['error']}',
+            '${httpFailure(code, result['error'])}',
           ),
           backgroundColor: Colors.red[800],
         ),
@@ -12272,7 +11789,9 @@ class _PackageManagerViewState extends State<PackageManagerView> {
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Resolve failed: HTTP ${code ?? result['error']}'),
+          content: Text(
+            'Resolve failed: ${httpFailure(code, result['error'])}',
+          ),
           backgroundColor: Colors.red[800],
         ),
       );
@@ -12463,6 +11982,7 @@ class _PackageManagerViewState extends State<PackageManagerView> {
     final packages = allPackages.where((package) {
       if (query.isEmpty) return true;
       return package.name.toLowerCase().contains(query) ||
+          package.displayName.toLowerCase().contains(query) ||
           package.status.toLowerCase().contains(query) ||
           package.source.toLowerCase().contains(query);
     }).toList();
@@ -12479,9 +11999,12 @@ class _PackageManagerViewState extends State<PackageManagerView> {
                 style: Theme.of(context).textTheme.titleLarge,
               ),
               const SizedBox(width: 12),
-              Text(
-                data.hasAdminStatus ? data.packageSummary : '/admin/status',
-                style: TextStyle(fontSize: 12, color: Colors.white38),
+              Flexible(
+                child: Text(
+                  data.hasAdminStatus ? data.packageSummary : '/admin/status',
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 12, color: Colors.white38),
+                ),
               ),
               const Spacer(),
               IconButton(
@@ -12496,23 +12019,29 @@ class _PackageManagerViewState extends State<PackageManagerView> {
                 tooltip: 'Refresh packages',
               ),
               const SizedBox(width: 8),
-              SizedBox(
-                width: 250,
-                height: 36,
-                child: TextField(
-                  controller: _searchController,
-                  onChanged: (_) => setState(() {}),
-                  decoration: InputDecoration(
-                    hintText: 'Search packages...',
-                    hintStyle: const TextStyle(fontSize: 12),
-                    prefixIcon: const Icon(Icons.search, size: 18),
-                    isDense: true,
-                    contentPadding: const EdgeInsets.symmetric(vertical: 8),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
+              // Shrinks in narrow windows instead of overflowing.
+              Flexible(
+                flex: 2,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 250),
+                  child: SizedBox(
+                    height: 36,
+                    child: TextField(
+                      controller: _searchController,
+                      onChanged: (_) => setState(() {}),
+                      decoration: InputDecoration(
+                        hintText: 'Search packages...',
+                        hintStyle: const TextStyle(fontSize: 12),
+                        prefixIcon: const Icon(Icons.search, size: 18),
+                        isDense: true,
+                        contentPadding: const EdgeInsets.symmetric(vertical: 8),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                      ),
+                      style: const TextStyle(fontSize: 13),
                     ),
                   ),
-                  style: const TextStyle(fontSize: 13),
                 ),
               ),
             ],
@@ -13004,11 +12533,16 @@ class _PackageStatus {
   String get statusLabel => _titleCase(status);
 
   factory _PackageStatus.fromMap(Map<String, dynamic> data) {
+    // The server sends `id` (e.g. "app-notes", what every /packages/{id}
+    // route takes) and `name` (a display name, e.g. "Notes"). Using `name` as
+    // the id made Install/Upgrade POST /packages/Notes/install → 400. Older
+    // servers sent only `name` (= the id), hence the fallback.
     final name =
-        data['name']?.toString() ??
         data['id']?.toString() ??
         data['package']?.toString() ??
+        data['name']?.toString() ??
         'package';
+    final label = data['name']?.toString();
     final status =
         data['status']?.toString() ??
         data['state']?.toString() ??
@@ -13024,7 +12558,9 @@ class _PackageStatus {
         data['description']?.toString() ?? _defaultDescription(name, status);
     return _PackageStatus(
       name: name,
-      displayName: _titleCase(name),
+      displayName: (label != null && label.isNotEmpty && label != name)
+          ? label
+          : _titleCase(name),
       description: description,
       source: source,
       version: version,
@@ -13048,339 +12584,6 @@ class _PackageStatus {
         .where((part) => part.isNotEmpty)
         .map((part) => '${part[0].toUpperCase()}${part.substring(1)}')
         .join(' ');
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Placeholder
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Visual Diagram — ER/UML style relationships between collections
-// ---------------------------------------------------------------------------
-
-class DiagramView extends StatelessWidget {
-  const DiagramView({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Stack(
-      children: [
-        // Background grid
-        CustomPaint(size: Size.infinite, painter: _GridPainter()),
-        // Connection lines (drawn behind boxes)
-        CustomPaint(size: Size.infinite, painter: _RelationPainter()),
-        // Collection boxes
-        _collectionBox(
-          context,
-          'Contacts',
-          [
-            'first_name',
-            'last_name',
-            'email',
-            'phone',
-            'organization_id → Orgs',
-            'lead_status',
-          ],
-          left: 60,
-          top: 40,
-          color: Colors.blue,
-        ),
-        _collectionBox(
-          context,
-          'Organizations',
-          ['name', 'website', 'industry', 'address', 'phone'],
-          left: 380,
-          top: 20,
-          color: Colors.teal,
-        ),
-        _collectionBox(
-          context,
-          'Invoices',
-          [
-            'customer_id → Contacts',
-            'invoice_date',
-            'due_date',
-            'status',
-            'line_items → Products',
-            'total (computed)',
-          ],
-          left: 60,
-          top: 320,
-          color: Colors.purple,
-        ),
-        _collectionBox(
-          context,
-          'Products',
-          ['name', 'description', 'price', 'sku', 'stock', 'category'],
-          left: 380,
-          top: 280,
-          color: Colors.orange,
-        ),
-        _collectionBox(
-          context,
-          'Orders',
-          [
-            'customer_id → Contacts',
-            'order_date',
-            'status',
-            'items → Products',
-            'shipping_address',
-            'total (computed)',
-          ],
-          left: 680,
-          top: 140,
-          color: Colors.green,
-        ),
-        _collectionBox(
-          context,
-          'Tasks',
-          [
-            'title',
-            'description',
-            'project_id → Projects',
-            'assignee_id → Users',
-            'status',
-            'due_date',
-          ],
-          left: 680,
-          top: 420,
-          color: Colors.red,
-        ),
-        _collectionBox(
-          context,
-          'Projects',
-          ['name', 'description', 'status', 'owner_id → Users'],
-          left: 380,
-          top: 510,
-          color: Colors.indigo,
-        ),
-        // Toolbar
-        Positioned(
-          top: 12,
-          right: 12,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            decoration: BoxDecoration(
-              color: Theme.of(context).colorScheme.surfaceContainerLow,
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: Colors.white10),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                IconButton(
-                  onPressed: () {},
-                  icon: const Icon(Icons.zoom_in, size: 18),
-                  visualDensity: VisualDensity.compact,
-                  tooltip: 'Zoom In',
-                ),
-                IconButton(
-                  onPressed: () {},
-                  icon: const Icon(Icons.zoom_out, size: 18),
-                  visualDensity: VisualDensity.compact,
-                  tooltip: 'Zoom Out',
-                ),
-                IconButton(
-                  onPressed: () {},
-                  icon: const Icon(Icons.fit_screen, size: 18),
-                  visualDensity: VisualDensity.compact,
-                  tooltip: 'Fit to Screen',
-                ),
-                const SizedBox(width: 8),
-                IconButton(
-                  onPressed: () {},
-                  icon: const Icon(Icons.add, size: 18),
-                  visualDensity: VisualDensity.compact,
-                  tooltip: 'Add Collection',
-                ),
-                IconButton(
-                  onPressed: () {},
-                  icon: const Icon(Icons.image_outlined, size: 18),
-                  visualDensity: VisualDensity.compact,
-                  tooltip: 'Export Image',
-                ),
-              ],
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _collectionBox(
-    BuildContext context,
-    String name,
-    List<String> fields, {
-    required double left,
-    required double top,
-    required Color color,
-  }) {
-    return Positioned(
-      left: left,
-      top: top,
-      child: Container(
-        width: 260,
-        decoration: BoxDecoration(
-          color: Theme.of(context).colorScheme.surfaceContainerLow,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: color.withOpacity(0.4)),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black26,
-              blurRadius: 8,
-              offset: const Offset(0, 2),
-            ),
-          ],
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Header
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              decoration: BoxDecoration(
-                color: color.withOpacity(0.15),
-                borderRadius: const BorderRadius.vertical(
-                  top: Radius.circular(7),
-                ),
-              ),
-              child: Row(
-                children: [
-                  Icon(Icons.storage, size: 14, color: color),
-                  const SizedBox(width: 6),
-                  Text(
-                    name,
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      fontSize: 13,
-                      color: color,
-                    ),
-                  ),
-                  const Spacer(),
-                  Text(
-                    '${fields.length}',
-                    style: TextStyle(fontSize: 11, color: Colors.white38),
-                  ),
-                ],
-              ),
-            ),
-            // Fields
-            ...fields.map((f) {
-              final isRelation = f.contains('→');
-              final isComputed = f.contains('(computed)');
-              return Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 3,
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      isRelation
-                          ? Icons.link
-                          : (isComputed ? Icons.functions : Icons.remove),
-                      size: 12,
-                      color: isRelation
-                          ? Colors.blue
-                          : (isComputed ? Colors.purple : Colors.white24),
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        f,
-                        style: TextStyle(
-                          fontSize: 11,
-                          fontFamily: 'monospace',
-                          color: isRelation
-                              ? Colors.blue[200]
-                              : (isComputed
-                                    ? Colors.purple[200]
-                                    : Colors.white54),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              );
-            }),
-            const SizedBox(height: 6),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _GridPainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = Colors.white.withOpacity(0.03)
-      ..strokeWidth = 1;
-    for (double x = 0; x < size.width; x += 40) {
-      canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
-    }
-    for (double y = 0; y < size.height; y += 40) {
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
-}
-
-class _RelationPainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = Colors.blue.withOpacity(0.3)
-      ..strokeWidth = 1.5
-      ..style = PaintingStyle.stroke;
-
-    // Contacts → Organizations
-    _drawArrow(canvas, paint, const Offset(320, 100), const Offset(380, 60));
-    // Invoices → Contacts
-    _drawArrow(canvas, paint, const Offset(150, 320), const Offset(150, 260));
-    // Invoices → Products
-    _drawArrow(canvas, paint, const Offset(320, 400), const Offset(380, 360));
-    // Orders → Contacts
-    paint.color = Colors.green.withOpacity(0.3);
-    _drawArrow(canvas, paint, const Offset(680, 200), const Offset(320, 120));
-    // Orders → Products
-    _drawArrow(canvas, paint, const Offset(680, 240), const Offset(640, 340));
-    // Tasks → Projects
-    paint.color = Colors.red.withOpacity(0.3);
-    _drawArrow(canvas, paint, const Offset(680, 500), const Offset(640, 540));
-  }
-
-  void _drawArrow(Canvas canvas, Paint paint, Offset from, Offset to) {
-    canvas.drawLine(from, to, paint);
-    // Arrowhead
-    final angle = (to - from).direction;
-    final arrowSize = 8.0;
-    canvas.drawLine(
-      to,
-      Offset(
-        to.dx -
-            arrowSize * (to - from).normalized.dx +
-            arrowSize * 0.4 * (to - from).normalized.dy,
-        to.dy -
-            arrowSize * (to - from).normalized.dy -
-            arrowSize * 0.4 * (to - from).normalized.dx,
-      ),
-      paint,
-    );
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
-}
-
-extension on Offset {
-  Offset get normalized {
-    final d = distance;
-    return d == 0 ? this : Offset(dx / d, dy / d);
   }
 }
 
@@ -13940,11 +13143,17 @@ class _IdentityRegistryViewState extends State<IdentityRegistryView> {
                 ),
               ),
               const SizedBox(width: 10),
-              if (_section == _IdentitySection.users &&
-                  ScrollData().passwordLoginEnabled)
-                _chip('PASSWORD WRITES ADMIN', Colors.orange)
-              else
-                _chip('READ ONLY', Colors.green),
+              Flexible(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child:
+                      _section == _IdentitySection.users &&
+                          ScrollData().passwordLoginEnabled
+                      ? _chip('PASSWORD WRITES ADMIN', Colors.orange)
+                      : _chip('READ ONLY', Colors.green),
+                ),
+              ),
               const Spacer(),
               OutlinedButton.icon(
                 onPressed: _loading ? null : _loadIdentity,
@@ -14214,15 +13423,25 @@ class _IdentityRegistryViewState extends State<IdentityRegistryView> {
             children: [
               Icon(icon, size: 18, color: color),
               const SizedBox(width: 8),
-              Text(
-                title,
-                style: const TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
+              // Narrow windows: title truncates, actions shrink (no overflow).
+              Expanded(
+                child: Text(
+                  title,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
-              const Spacer(),
-              if (trailing != null) trailing,
+              if (trailing != null)
+                Flexible(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerRight,
+                    child: trailing,
+                  ),
+                ),
             ],
           ),
           const SizedBox(height: 12),
@@ -15251,7 +14470,7 @@ class _GlobalSearchViewState extends State<GlobalSearchView> {
           ok
               ? '$collection/$recordId is now '
                     '${makePublic ? 'public' : 'private'}'
-              : 'Update failed: HTTP ${status ?? result['error'] ?? '?'}',
+              : 'Update failed: ${httpFailure(status, result['error'])}',
         ),
         backgroundColor: ok ? Colors.green[800] : Colors.red[800],
       ),
@@ -15578,7 +14797,7 @@ class _OpsEventsViewState extends State<OpsEventsView> {
     if (status is! int || status < 200 || status >= 300) {
       setState(() {
         _loading = false;
-        _error = 'HTTP ${status ?? result['error'] ?? '?'}';
+        _error = httpFailure(status, result['error']);
       });
       return;
     }
@@ -16154,12 +15373,14 @@ class _ChangesViewState extends State<ChangesView> {
         ],
       ),
       child: visible.isEmpty
-          ? Center(
-              child: Text(
-                'No changes',
-                style: TextStyle(color: Colors.white38),
-              ),
-            )
+          ? (ScrollAPI().adminLocked.value
+                ? const LockedNotice(what: 'admin changes')
+                : Center(
+                    child: Text(
+                      'No changes',
+                      style: TextStyle(color: Colors.white38),
+                    ),
+                  ))
           : ListView.separated(
               itemCount: visible.length,
               separatorBuilder: (_, __) => const SizedBox(height: 8),
@@ -16308,15 +15529,25 @@ class _ChangesViewState extends State<ChangesView> {
             children: [
               Icon(icon, size: 18, color: color),
               const SizedBox(width: 8),
-              Text(
-                title,
-                style: const TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
+              // Narrow windows: title truncates, actions shrink (no overflow).
+              Expanded(
+                child: Text(
+                  title,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
-              const Spacer(),
-              if (trailing != null) trailing,
+              if (trailing != null)
+                Flexible(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerRight,
+                    child: trailing,
+                  ),
+                ),
             ],
           ),
           const SizedBox(height: 12),
@@ -17350,15 +16581,25 @@ class _FileManagerViewState extends State<FileManagerView> {
             children: [
               Icon(icon, size: 18, color: color),
               const SizedBox(width: 8),
-              Text(
-                title,
-                style: const TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
+              // Narrow windows: title truncates, actions shrink (no overflow).
+              Expanded(
+                child: Text(
+                  title,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
-              const Spacer(),
-              if (trailing != null) trailing,
+              if (trailing != null)
+                Flexible(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerRight,
+                    child: trailing,
+                  ),
+                ),
             ],
           ),
           const SizedBox(height: 12),
@@ -17763,7 +17004,7 @@ class _SettingsViewState extends State<SettingsView> {
       } else if (status == 403) {
         _themeStatus = 'Switching the theme needs an admin session (got 403).';
       } else {
-        _themeStatus = 'Failed: HTTP ${status ?? result['error'] ?? '?'}';
+        _themeStatus = 'Failed: ${httpFailure(status, result['error'])}';
       }
     });
   }
@@ -17815,7 +17056,7 @@ class _SettingsViewState extends State<SettingsView> {
       _serverKeyBusy = false;
       _serverKeyStatus = ok
           ? '$_service key stored on the server'
-          : 'Failed: HTTP ${status ?? result['error'] ?? '?'}';
+          : 'Failed: ${httpFailure(status, result['error'])}';
       if (ok) _serviceKeyController.clear();
     });
     if (ok) _loadServerKeys();
@@ -17833,7 +17074,7 @@ class _SettingsViewState extends State<SettingsView> {
       _serverKeyBusy = false;
       _serverKeyStatus = ok
           ? '$service key removed'
-          : 'Failed: HTTP ${status ?? result['error'] ?? '?'}';
+          : 'Failed: ${httpFailure(status, result['error'])}';
     });
     if (ok) _loadServerKeys();
   }
@@ -18544,7 +17785,7 @@ class _AICreateViewState extends State<AICreateView> {
         setState(() => _saveResult = 'Test run OK — returned JSON');
       }
     } else if (status != null) {
-      setState(() => _saveResult = 'Test run failed — HTTP $status');
+      setState(() => _saveResult = 'Test run failed — ${httpFailure(status)}');
     } else {
       setState(() => _saveResult = 'Test run failed');
     }
@@ -19379,6 +18620,13 @@ class _PermissionsViewState extends State<PermissionsView> {
         ]),
       ),
       _entry(
+        'password_login',
+        _firstValue([
+          permissions['password_login_enabled'],
+          capabilityIdentity['password_login_enabled'],
+        ]),
+      ),
+      _entry(
         'session_login',
         _firstValue([
           permissions['session_login_enabled'],
@@ -19407,6 +18655,7 @@ class _PermissionsViewState extends State<PermissionsView> {
         _firstValue([
           identity['active_users'],
           identity['active_user_count'],
+          _section(identity, const ['users'])['active'],
           status['active_users'],
           status['active_user_count'],
         ]),
@@ -19416,6 +18665,7 @@ class _PermissionsViewState extends State<PermissionsView> {
         _firstValue([
           identity['active_sessions'],
           identity['active_session_count'],
+          _section(identity, const ['sessions'])['active'],
           status['active_sessions'],
           status['active_session_count'],
         ]),
@@ -19429,7 +18679,9 @@ class _PermissionsViewState extends State<PermissionsView> {
   ) {
     final shape = _section(status, const ['policy_shape']);
     final policyShape = _section(policy, const ['shape']);
-    final source = {...policy, ...shape, ...policyShape};
+    // The real server summarises the policy under status.policy.
+    final statusPolicy = _section(status, const ['policy']);
+    final source = {...policy, ...statusPolicy, ...shape, ...policyShape};
     return [
       _entry(
         'access_mode',
@@ -19499,7 +18751,8 @@ class _PermissionsViewState extends State<PermissionsView> {
           readiness['has_non_admin_identity_path'],
         ]),
       ),
-    ];
+      // Optional extras: hidden when this server version doesn't send them.
+    ].where((e) => e.value != 'not reported').toList();
   }
 
   MapEntry<String, dynamic> _entry(String key, dynamic value) {
@@ -20208,7 +19461,11 @@ class _APIExplorerViewState extends State<APIExplorerView> {
                       Text(
                         _usesPlatform
                             ? 'LEGACY PLATFORM — Token auth'
-                            : 'OBJECT SERVER — Bearer admin token',
+                            : 'OBJECT SERVER — Bearer ${switch (ScrollAPI().credentialKind) {
+                                CredentialKind.session => 'session (${ScrollAPI().sessionUserId ?? 'signed in'})',
+                                CredentialKind.apiKey => 'API key',
+                                CredentialKind.adminToken => 'admin token',
+                              }}',
                         style: TextStyle(fontSize: 11, color: Colors.green),
                       ),
                       const Spacer(),
@@ -20249,222 +19506,6 @@ class _APIExplorerViewState extends State<APIExplorerView> {
                   ),
                 ),
               ],
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// SQL Query (admin — power user feature)
-// ---------------------------------------------------------------------------
-
-class SQLQueryView extends StatelessWidget {
-  const SQLQueryView({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: [
-        // Query editor
-        Container(
-          height: 200,
-          padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            border: Border(bottom: BorderSide(color: Colors.white10)),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Text(
-                    'SQL Query',
-                    style: Theme.of(context).textTheme.titleSmall,
-                  ),
-                  const SizedBox(width: 12),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 6,
-                      vertical: 2,
-                    ),
-                    decoration: BoxDecoration(
-                      color: Colors.orange.withOpacity(0.12),
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    child: Text(
-                      'via object server',
-                      style: TextStyle(fontSize: 10, color: Colors.orange),
-                    ),
-                  ),
-                  const Spacer(),
-                  OutlinedButton.icon(
-                    onPressed: () {},
-                    icon: Icon(
-                      Icons.auto_awesome,
-                      size: 14,
-                      color: Colors.amber,
-                    ),
-                    label: Text(
-                      'AI: natural language',
-                      style: TextStyle(fontSize: 12, color: Colors.amber),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  FilledButton.icon(
-                    onPressed: () {},
-                    icon: const Icon(Icons.play_arrow, size: 16),
-                    label: const Text('Run'),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              Expanded(
-                child: TextField(
-                  maxLines: null,
-                  expands: true,
-                  controller: TextEditingController(
-                    text:
-                        'SELECT c.first_name, c.last_name, c.email,\n'
-                        '       COUNT(i.id) as invoice_count,\n'
-                        '       SUM(i.total) as total_spent\n'
-                        'FROM contacts c\n'
-                        'LEFT JOIN invoices i ON i.customer_id = c.id\n'
-                        'GROUP BY c.id\n'
-                        'HAVING SUM(i.total) > 1000\n'
-                        'ORDER BY total_spent DESC\n'
-                        'LIMIT 20;',
-                  ),
-                  decoration: InputDecoration(
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    contentPadding: const EdgeInsets.all(12),
-                  ),
-                  style: TextStyle(
-                    fontFamily: 'monospace',
-                    fontSize: 13,
-                    color: Colors.green[300],
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-        // Results
-        Container(
-          height: 32,
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          decoration: BoxDecoration(
-            color: Colors.green.withOpacity(0.05),
-            border: Border(bottom: BorderSide(color: Colors.white10)),
-          ),
-          child: Row(
-            children: [
-              Icon(Icons.check_circle, size: 14, color: Colors.green),
-              const SizedBox(width: 6),
-              Text(
-                '8 rows returned in 45ms',
-                style: TextStyle(fontSize: 12, color: Colors.green),
-              ),
-              const Spacer(),
-              TextButton(
-                onPressed: () {},
-                child: Text('Export CSV', style: TextStyle(fontSize: 11)),
-              ),
-              TextButton(
-                onPressed: () {},
-                child: Text('Explain', style: TextStyle(fontSize: 11)),
-              ),
-            ],
-          ),
-        ),
-        Expanded(
-          child: SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: SingleChildScrollView(
-              child: DataTable(
-                headingRowHeight: 32,
-                dataRowMinHeight: 30,
-                dataRowMaxHeight: 30,
-                columnSpacing: 32,
-                headingTextStyle: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white54,
-                ),
-                dataTextStyle: TextStyle(fontSize: 12, fontFamily: 'monospace'),
-                columns: const [
-                  DataColumn(label: Text('first_name')),
-                  DataColumn(label: Text('last_name')),
-                  DataColumn(label: Text('email')),
-                  DataColumn(label: Text('invoice_count'), numeric: true),
-                  DataColumn(label: Text('total_spent'), numeric: true),
-                ],
-                rows:
-                    [
-                          [
-                            'Alice',
-                            'Chen',
-                            'alice@acmecorp.com',
-                            '12',
-                            '\$45,200',
-                          ],
-                          ['Bob', 'Smith', 'bob@techstart.io', '8', '\$23,400'],
-                          [
-                            'Carol',
-                            'Davis',
-                            'carol@dataflow.com',
-                            '15',
-                            '\$18,750',
-                          ],
-                          [
-                            'Dan',
-                            'Wilson',
-                            'dan@cloudnine.co',
-                            '6',
-                            '\$12,300',
-                          ],
-                          [
-                            'Eva',
-                            'Martinez',
-                            'eva@acmecorp.com',
-                            '9',
-                            '\$8,900',
-                          ],
-                          [
-                            'Frank',
-                            'Lee',
-                            'frank@techstart.io',
-                            '4',
-                            '\$5,600',
-                          ],
-                          [
-                            'Grace',
-                            'Kim',
-                            'grace@dataflow.com',
-                            '7',
-                            '\$3,200',
-                          ],
-                          [
-                            'Henry',
-                            'Park',
-                            'henry@cloudnine.co',
-                            '3',
-                            '\$1,450',
-                          ],
-                        ]
-                        .map(
-                          (row) => DataRow(
-                            cells: row
-                                .map((cell) => DataCell(Text(cell)))
-                                .toList(),
-                          ),
-                        )
-                        .toList(),
-              ),
             ),
           ),
         ),
@@ -20542,7 +19583,7 @@ class _BackupViewState extends State<BackupView> {
       _statusIsError = !ok;
       _status = ok
           ? 'Backup created.'
-          : 'Backup failed: HTTP ${code ?? result['error'] ?? '?'}';
+          : 'Backup failed: ${httpFailure(code, result['error'])}';
     });
     if (ok) _refresh();
   }
@@ -20614,14 +19655,26 @@ class _BackupViewState extends State<BackupView> {
         children: [
           Row(
             children: [
-              Text(
-                'Backup & Restore',
-                style: Theme.of(context).textTheme.titleLarge,
+              // Title and chip shrink in narrow windows; the buttons stay.
+              Flexible(
+                child: Text(
+                  'Backup & Restore',
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
               ),
               const SizedBox(width: 10),
-              _chip(
-                apiExposed ? 'BACKUP API AVAILABLE' : 'Backup API not exposed',
-                apiExposed ? Colors.green : Colors.white54,
+              Flexible(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: _chip(
+                    apiExposed
+                        ? 'BACKUP API AVAILABLE'
+                        : 'Backup API not exposed',
+                    apiExposed ? Colors.green : Colors.white54,
+                  ),
+                ),
               ),
               const Spacer(),
               if (_loading)
@@ -20993,6 +20046,1755 @@ class _BackupViewState extends State<BackupView> {
           fontWeight: FontWeight.bold,
         ),
       ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MOCKUPS — design placeholders kept on purpose: they show what is planned.
+// They use sample data and are NOT connected to a server yet. Every place
+// that shows one labels it with MockupBanner / a MOCKUP tag. Restored
+// verbatim from e8a817f.
+// ---------------------------------------------------------------------------
+
+class SQLQueryView extends StatelessWidget {
+  const SQLQueryView({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        // Query editor
+        Container(
+          height: 200,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            border: Border(bottom: BorderSide(color: Colors.white10)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Text(
+                    'SQL Query',
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                  const SizedBox(width: 12),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.orange.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Text(
+                      'via object server',
+                      style: TextStyle(fontSize: 10, color: Colors.orange),
+                    ),
+                  ),
+                  const Spacer(),
+                  OutlinedButton.icon(
+                    onPressed: () {},
+                    icon: Icon(
+                      Icons.auto_awesome,
+                      size: 14,
+                      color: Colors.amber,
+                    ),
+                    label: Text(
+                      'AI: natural language',
+                      style: TextStyle(fontSize: 12, color: Colors.amber),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton.icon(
+                    onPressed: () {},
+                    icon: const Icon(Icons.play_arrow, size: 16),
+                    label: const Text('Run'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Expanded(
+                child: TextField(
+                  maxLines: null,
+                  expands: true,
+                  controller: TextEditingController(
+                    text:
+                        'SELECT c.first_name, c.last_name, c.email,\n'
+                        '       COUNT(i.id) as invoice_count,\n'
+                        '       SUM(i.total) as total_spent\n'
+                        'FROM contacts c\n'
+                        'LEFT JOIN invoices i ON i.customer_id = c.id\n'
+                        'GROUP BY c.id\n'
+                        'HAVING SUM(i.total) > 1000\n'
+                        'ORDER BY total_spent DESC\n'
+                        'LIMIT 20;',
+                  ),
+                  decoration: InputDecoration(
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    contentPadding: const EdgeInsets.all(12),
+                  ),
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 13,
+                    color: Colors.green[300],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        // Results
+        Container(
+          height: 32,
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          decoration: BoxDecoration(
+            color: Colors.green.withOpacity(0.05),
+            border: Border(bottom: BorderSide(color: Colors.white10)),
+          ),
+          child: Row(
+            children: [
+              Icon(Icons.check_circle, size: 14, color: Colors.green),
+              const SizedBox(width: 6),
+              Text(
+                '8 rows returned in 45ms',
+                style: TextStyle(fontSize: 12, color: Colors.green),
+              ),
+              const Spacer(),
+              TextButton(
+                onPressed: () {},
+                child: Text('Export CSV', style: TextStyle(fontSize: 11)),
+              ),
+              TextButton(
+                onPressed: () {},
+                child: Text('Explain', style: TextStyle(fontSize: 11)),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: SingleChildScrollView(
+              child: DataTable(
+                headingRowHeight: 32,
+                dataRowMinHeight: 30,
+                dataRowMaxHeight: 30,
+                columnSpacing: 32,
+                headingTextStyle: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white54,
+                ),
+                dataTextStyle: TextStyle(fontSize: 12, fontFamily: 'monospace'),
+                columns: const [
+                  DataColumn(label: Text('first_name')),
+                  DataColumn(label: Text('last_name')),
+                  DataColumn(label: Text('email')),
+                  DataColumn(label: Text('invoice_count'), numeric: true),
+                  DataColumn(label: Text('total_spent'), numeric: true),
+                ],
+                rows:
+                    [
+                          [
+                            'Alice',
+                            'Chen',
+                            'alice@acmecorp.com',
+                            '12',
+                            '\$45,200',
+                          ],
+                          ['Bob', 'Smith', 'bob@techstart.io', '8', '\$23,400'],
+                          [
+                            'Carol',
+                            'Davis',
+                            'carol@dataflow.com',
+                            '15',
+                            '\$18,750',
+                          ],
+                          [
+                            'Dan',
+                            'Wilson',
+                            'dan@cloudnine.co',
+                            '6',
+                            '\$12,300',
+                          ],
+                          [
+                            'Eva',
+                            'Martinez',
+                            'eva@acmecorp.com',
+                            '9',
+                            '\$8,900',
+                          ],
+                          [
+                            'Frank',
+                            'Lee',
+                            'frank@techstart.io',
+                            '4',
+                            '\$5,600',
+                          ],
+                          [
+                            'Grace',
+                            'Kim',
+                            'grace@dataflow.com',
+                            '7',
+                            '\$3,200',
+                          ],
+                          [
+                            'Henry',
+                            'Park',
+                            'henry@cloudnine.co',
+                            '3',
+                            '\$1,450',
+                          ],
+                        ]
+                        .map(
+                          (row) => DataRow(
+                            cells: row
+                                .map((cell) => DataCell(Text(cell)))
+                                .toList(),
+                          ),
+                        )
+                        .toList(),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class DiagramView extends StatelessWidget {
+  const DiagramView({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        // Background grid
+        CustomPaint(size: Size.infinite, painter: _GridPainter()),
+        // Connection lines (drawn behind boxes)
+        CustomPaint(size: Size.infinite, painter: _RelationPainter()),
+        // Collection boxes
+        _collectionBox(
+          context,
+          'Contacts',
+          [
+            'first_name',
+            'last_name',
+            'email',
+            'phone',
+            'organization_id → Orgs',
+            'lead_status',
+          ],
+          left: 60,
+          top: 40,
+          color: Colors.blue,
+        ),
+        _collectionBox(
+          context,
+          'Organizations',
+          ['name', 'website', 'industry', 'address', 'phone'],
+          left: 380,
+          top: 20,
+          color: Colors.teal,
+        ),
+        _collectionBox(
+          context,
+          'Invoices',
+          [
+            'customer_id → Contacts',
+            'invoice_date',
+            'due_date',
+            'status',
+            'line_items → Products',
+            'total (computed)',
+          ],
+          left: 60,
+          top: 320,
+          color: Colors.purple,
+        ),
+        _collectionBox(
+          context,
+          'Products',
+          ['name', 'description', 'price', 'sku', 'stock', 'category'],
+          left: 380,
+          top: 280,
+          color: Colors.orange,
+        ),
+        _collectionBox(
+          context,
+          'Orders',
+          [
+            'customer_id → Contacts',
+            'order_date',
+            'status',
+            'items → Products',
+            'shipping_address',
+            'total (computed)',
+          ],
+          left: 680,
+          top: 140,
+          color: Colors.green,
+        ),
+        _collectionBox(
+          context,
+          'Tasks',
+          [
+            'title',
+            'description',
+            'project_id → Projects',
+            'assignee_id → Users',
+            'status',
+            'due_date',
+          ],
+          left: 680,
+          top: 420,
+          color: Colors.red,
+        ),
+        _collectionBox(
+          context,
+          'Projects',
+          ['name', 'description', 'status', 'owner_id → Users'],
+          left: 380,
+          top: 510,
+          color: Colors.indigo,
+        ),
+        // Toolbar
+        Positioned(
+          top: 12,
+          right: 12,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surfaceContainerLow,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.white10),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  onPressed: () {},
+                  icon: const Icon(Icons.zoom_in, size: 18),
+                  visualDensity: VisualDensity.compact,
+                  tooltip: 'Zoom In',
+                ),
+                IconButton(
+                  onPressed: () {},
+                  icon: const Icon(Icons.zoom_out, size: 18),
+                  visualDensity: VisualDensity.compact,
+                  tooltip: 'Zoom Out',
+                ),
+                IconButton(
+                  onPressed: () {},
+                  icon: const Icon(Icons.fit_screen, size: 18),
+                  visualDensity: VisualDensity.compact,
+                  tooltip: 'Fit to Screen',
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  onPressed: () {},
+                  icon: const Icon(Icons.add, size: 18),
+                  visualDensity: VisualDensity.compact,
+                  tooltip: 'Add Collection',
+                ),
+                IconButton(
+                  onPressed: () {},
+                  icon: const Icon(Icons.image_outlined, size: 18),
+                  visualDensity: VisualDensity.compact,
+                  tooltip: 'Export Image',
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _collectionBox(
+    BuildContext context,
+    String name,
+    List<String> fields, {
+    required double left,
+    required double top,
+    required Color color,
+  }) {
+    return Positioned(
+      left: left,
+      top: top,
+      child: Container(
+        width: 260,
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surfaceContainerLow,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: color.withOpacity(0.4)),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black26,
+              blurRadius: 8,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Header
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: color.withOpacity(0.15),
+                borderRadius: const BorderRadius.vertical(
+                  top: Radius.circular(7),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.storage, size: 14, color: color),
+                  const SizedBox(width: 6),
+                  Text(
+                    name,
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13,
+                      color: color,
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    '${fields.length}',
+                    style: TextStyle(fontSize: 11, color: Colors.white38),
+                  ),
+                ],
+              ),
+            ),
+            // Fields
+            ...fields.map((f) {
+              final isRelation = f.contains('→');
+              final isComputed = f.contains('(computed)');
+              return Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 3,
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      isRelation
+                          ? Icons.link
+                          : (isComputed ? Icons.functions : Icons.remove),
+                      size: 12,
+                      color: isRelation
+                          ? Colors.blue
+                          : (isComputed ? Colors.purple : Colors.white24),
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        f,
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontFamily: 'monospace',
+                          color: isRelation
+                              ? Colors.blue[200]
+                              : (isComputed
+                                    ? Colors.purple[200]
+                                    : Colors.white54),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }),
+            const SizedBox(height: 6),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _GridPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = Colors.white.withOpacity(0.03)
+      ..strokeWidth = 1;
+    for (double x = 0; x < size.width; x += 40) {
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
+    }
+    for (double y = 0; y < size.height; y += 40) {
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+class _RelationPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = Colors.blue.withOpacity(0.3)
+      ..strokeWidth = 1.5
+      ..style = PaintingStyle.stroke;
+
+    // Contacts → Organizations
+    _drawArrow(canvas, paint, const Offset(320, 100), const Offset(380, 60));
+    // Invoices → Contacts
+    _drawArrow(canvas, paint, const Offset(150, 320), const Offset(150, 260));
+    // Invoices → Products
+    _drawArrow(canvas, paint, const Offset(320, 400), const Offset(380, 360));
+    // Orders → Contacts
+    paint.color = Colors.green.withOpacity(0.3);
+    _drawArrow(canvas, paint, const Offset(680, 200), const Offset(320, 120));
+    // Orders → Products
+    _drawArrow(canvas, paint, const Offset(680, 240), const Offset(640, 340));
+    // Tasks → Projects
+    paint.color = Colors.red.withOpacity(0.3);
+    _drawArrow(canvas, paint, const Offset(680, 500), const Offset(640, 540));
+  }
+
+  void _drawArrow(Canvas canvas, Paint paint, Offset from, Offset to) {
+    canvas.drawLine(from, to, paint);
+    // Arrowhead
+    final angle = (to - from).direction;
+    final arrowSize = 8.0;
+    canvas.drawLine(
+      to,
+      Offset(
+        to.dx -
+            arrowSize * (to - from).normalized.dx +
+            arrowSize * 0.4 * (to - from).normalized.dy,
+        to.dy -
+            arrowSize * (to - from).normalized.dy -
+            arrowSize * 0.4 * (to - from).normalized.dx,
+      ),
+      paint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+extension on Offset {
+  Offset get normalized {
+    final d = distance;
+    return d == 0 ? this : Offset(dx / d, dy / d);
+  }
+}
+
+class ReportView extends StatelessWidget {
+  const ReportView({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(32),
+      child: Center(
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 800),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Report header
+              Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Monthly Sales Report',
+                          style: Theme.of(context).textTheme.titleLarge,
+                        ),
+                        Text(
+                          'April 2026 — Grouped by Region',
+                          style: TextStyle(fontSize: 13, color: Colors.white38),
+                        ),
+                      ],
+                    ),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () {},
+                    icon: const Icon(Icons.picture_as_pdf, size: 16),
+                    label: const Text('Export PDF'),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: () {},
+                    icon: const Icon(Icons.print, size: 16),
+                    label: const Text('Print'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 24),
+
+              // Report groups
+              _reportGroup(context, 'West Region', [
+                ['Acme Corp', '42', '\$12,600'],
+                ['TechStart', '28', '\$8,400'],
+                ['CloudNine', '15', '\$4,500'],
+              ], '\$25,500'),
+
+              _reportGroup(context, 'East Region', [
+                ['DataFlow', '38', '\$11,400'],
+                ['NetWorks', '22', '\$6,600'],
+                ['ByteSize', '19', '\$5,700'],
+              ], '\$23,700'),
+
+              _reportGroup(context, 'Central Region', [
+                ['MidTech', '31', '\$9,300'],
+                ['CoreData', '17', '\$5,100'],
+              ], '\$14,400'),
+
+              const SizedBox(height: 8),
+              const Divider(thickness: 2),
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Row(
+                  children: [
+                    Text(
+                      'GRAND TOTAL',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                      ),
+                    ),
+                    const Spacer(),
+                    Text(
+                      '\$63,600',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.green[300],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _reportGroup(
+    BuildContext context,
+    String region,
+    List<List<String>> rows,
+    String subtotal,
+  ) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: Theme.of(
+              context,
+            ).colorScheme.primaryContainer.withOpacity(0.15),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Text(
+            region,
+            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+          ),
+        ),
+        const SizedBox(height: 4),
+        ...rows.map(
+          (row) => Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            child: Row(
+              children: [
+                Expanded(
+                  flex: 3,
+                  child: Text(row[0], style: const TextStyle(fontSize: 13)),
+                ),
+                Expanded(
+                  child: Text(
+                    '${row[1]} units',
+                    style: TextStyle(fontSize: 13, color: Colors.white54),
+                  ),
+                ),
+                SizedBox(
+                  width: 100,
+                  child: Text(
+                    row[2],
+                    textAlign: TextAlign.right,
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          child: Row(
+            children: [
+              const Spacer(),
+              Text(
+                'Subtotal: $subtotal',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white70,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const Divider(),
+        const SizedBox(height: 8),
+      ],
+    );
+  }
+}
+
+class InvoiceFormView extends StatelessWidget {
+  const InvoiceFormView({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(32),
+      child: Center(
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 750),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Header
+              Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Invoice #1043',
+                          style: Theme.of(context).textTheme.titleLarge,
+                        ),
+                        Text(
+                          'Draft — not yet sent',
+                          style: TextStyle(fontSize: 13, color: Colors.orange),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Row(
+                    children: [
+                      IconButton(
+                        onPressed: () {},
+                        icon: const Icon(Icons.chevron_left, size: 20),
+                        tooltip: 'Previous',
+                        visualDensity: VisualDensity.compact,
+                      ),
+                      const Text(
+                        '#1043',
+                        style: TextStyle(fontSize: 12, color: Colors.white38),
+                      ),
+                      IconButton(
+                        onPressed: () {},
+                        icon: const Icon(Icons.chevron_right, size: 20),
+                        tooltip: 'Next',
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 20),
+
+              // Customer section — auto-loaded sub-data
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surfaceContainerLow,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.white10),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Text(
+                          'CUSTOMER',
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white38,
+                            letterSpacing: 1,
+                          ),
+                        ),
+                        const Spacer(),
+                        Text(
+                          'auto-loaded from contacts',
+                          style: TextStyle(
+                            fontSize: 10,
+                            color: Colors.blue,
+                            fontStyle: FontStyle.italic,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: DropdownButtonFormField<String>(
+                            decoration: const InputDecoration(
+                              labelText: 'Customer',
+                              border: OutlineInputBorder(),
+                              isDense: true,
+                            ),
+                            value: 'Acme Corp',
+                            items:
+                                [
+                                      'Acme Corp',
+                                      'TechStart',
+                                      'DataFlow',
+                                      'CloudNine',
+                                    ]
+                                    .map(
+                                      (v) => DropdownMenuItem(
+                                        value: v,
+                                        child: Text(v),
+                                      ),
+                                    )
+                                    .toList(),
+                            onChanged: (_) {},
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    // Auto-loaded customer details
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.blue.withOpacity(0.05),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: Colors.blue.withOpacity(0.15),
+                        ),
+                      ),
+                      child: Column(
+                        children: [
+                          _subDataRow(
+                            'Contact',
+                            'Alice Chen — alice@acmecorp.com',
+                          ),
+                          _subDataRow(
+                            'Address',
+                            '123 Business Ave, Houston TX 77002',
+                          ),
+                          _subDataRow('Payment Terms', 'Net 30'),
+                          _subDataRow('Outstanding', '\$4,200 (2 invoices)'),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Invoice details
+              Row(
+                children: [
+                  Expanded(
+                    child: AdminFieldOverlay(
+                      fieldName: 'Invoice Date',
+                      fieldType: 'date',
+                      required: true,
+                      child: TextField(
+                        decoration: const InputDecoration(
+                          labelText: 'Invoice Date',
+                          border: OutlineInputBorder(),
+                          suffixIcon: Icon(Icons.calendar_today, size: 18),
+                        ),
+                        controller: TextEditingController(text: '2026-04-08'),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: AdminFieldOverlay(
+                      fieldName: 'Due Date',
+                      fieldType: 'date',
+                      required: true,
+                      child: TextField(
+                        decoration: const InputDecoration(
+                          labelText: 'Due Date',
+                          border: OutlineInputBorder(),
+                          suffixIcon: Icon(Icons.calendar_today, size: 18),
+                        ),
+                        controller: TextEditingController(text: '2026-05-08'),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: AdminFieldOverlay(
+                      fieldName: 'Status',
+                      fieldType: 'dropdown',
+                      child: DropdownButtonFormField<String>(
+                        decoration: const InputDecoration(
+                          labelText: 'Status',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        value: 'draft',
+                        items: ['draft', 'sent', 'paid', 'overdue', 'cancelled']
+                            .map(
+                              (v) => DropdownMenuItem(value: v, child: Text(v)),
+                            )
+                            .toList(),
+                        onChanged: (_) {},
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 20),
+
+              // Line items — sub-data table
+              AdminFieldOverlay(
+                fieldName: 'Line Items',
+                fieldType: 'sub_table',
+                rolePermissions: const {'sales': 'edit'},
+                child: Column(
+                  children: [
+                    Row(
+                      children: [
+                        Text(
+                          'LINE ITEMS',
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white38,
+                            letterSpacing: 1,
+                          ),
+                        ),
+                        const Spacer(),
+                        TextButton.icon(
+                          onPressed: () {},
+                          icon: const Icon(Icons.add, size: 16),
+                          label: const Text(
+                            'Add Line',
+                            style: TextStyle(fontSize: 12),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Container(
+                      decoration: BoxDecoration(
+                        border: Border.all(color: Colors.white10),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: DataTable(
+                        headingRowHeight: 36,
+                        dataRowMinHeight: 40,
+                        dataRowMaxHeight: 40,
+                        columnSpacing: 16,
+                        headingTextStyle: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white54,
+                        ),
+                        dataTextStyle: const TextStyle(fontSize: 13),
+                        columns: const [
+                          DataColumn(label: Text('Product')),
+                          DataColumn(label: Text('Description')),
+                          DataColumn(label: Text('Qty'), numeric: true),
+                          DataColumn(label: Text('Unit Price'), numeric: true),
+                          DataColumn(label: Text('Total'), numeric: true),
+                          DataColumn(label: Text('')),
+                        ],
+                        rows: [
+                          _lineItem(
+                            'Web Hosting',
+                            'Annual plan — Pro tier',
+                            1,
+                            299.00,
+                          ),
+                          _lineItem(
+                            'SSL Certificate',
+                            'Wildcard, 1 year',
+                            2,
+                            79.00,
+                          ),
+                          _lineItem(
+                            'Support Hours',
+                            'Priority support block',
+                            10,
+                            150.00,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              // Totals
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surfaceContainerLow,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Column(
+                  children: [
+                    _totalRow('Subtotal', '\$1,957.00'),
+                    _totalRow('Tax (8.25%)', '\$161.45'),
+                    const Divider(),
+                    _totalRow('Total', '\$2,118.45', bold: true, large: true),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Notes
+              AdminFieldOverlay(
+                fieldName: 'Notes',
+                fieldType: 'textarea',
+                rolePermissions: const {'sales': 'read'},
+                child: TextField(
+                  maxLines: 2,
+                  decoration: const InputDecoration(
+                    labelText: 'Notes',
+                    border: OutlineInputBorder(),
+                    alignLabelWithHint: true,
+                  ),
+                  controller: TextEditingController(
+                    text:
+                        'Payment due within 30 days. Thank you for your business.',
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+
+              // Ownership & permissions
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.03),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.white10),
+                ),
+                child: Column(
+                  children: [
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.person_outline,
+                          size: 16,
+                          color: Colors.white38,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Owner: you',
+                          style: TextStyle(fontSize: 12, color: Colors.white38),
+                        ),
+                        const Spacer(),
+                        Text(
+                          'Access: ROLE-BASED',
+                          style: TextStyle(fontSize: 12, color: Colors.orange),
+                        ),
+                      ],
+                    ),
+                    const Divider(height: 16),
+                    Row(
+                      children: [
+                        Icon(Icons.visibility, size: 14, color: Colors.white24),
+                        const SizedBox(width: 6),
+                        Text(
+                          'Field Permissions (your role: admin)',
+                          style: TextStyle(fontSize: 11, color: Colors.white38),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 4,
+                      children: [
+                        _permChip('Customer', true, true),
+                        _permChip('Dates', true, true),
+                        _permChip('Line Items', true, true),
+                        _permChip('Totals', true, false),
+                        _permChip('Notes', true, true),
+                        _permChip('Status', true, true),
+                        _permChip('Cost Price', false, false),
+                        _permChip('Margin', false, false),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.info_outline,
+                          size: 13,
+                          color: Colors.white24,
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            '"sales" role cannot see Cost Price or Margin fields. Totals are read-only for non-admin.',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: Colors.white30,
+                              fontStyle: FontStyle.italic,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+
+              const SizedBox(height: 24),
+
+              // Actions
+              Row(
+                children: [
+                  FilledButton.icon(
+                    onPressed: () {},
+                    icon: const Icon(Icons.save, size: 18),
+                    label: const Text('Save'),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: () {},
+                    icon: const Icon(Icons.send, size: 16),
+                    label: const Text('Save & Send'),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: () {},
+                    icon: const Icon(Icons.picture_as_pdf, size: 16),
+                    label: const Text('PDF'),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: () {},
+                    icon: const Icon(Icons.print, size: 16),
+                    label: const Text('Print'),
+                  ),
+                  const Spacer(),
+                  TextButton.icon(
+                    onPressed: () {},
+                    icon: const Icon(
+                      Icons.auto_awesome,
+                      size: 16,
+                      color: Colors.amber,
+                    ),
+                    label: const Text(
+                      'AI Fill',
+                      style: TextStyle(color: Colors.amber),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  DataRow _lineItem(String product, String desc, int qty, double price) {
+    return DataRow(
+      cells: [
+        DataCell(Text(product)),
+        DataCell(
+          Text(desc, style: TextStyle(color: Colors.white54, fontSize: 12)),
+        ),
+        DataCell(Text('$qty')),
+        DataCell(Text('\$${price.toStringAsFixed(2)}')),
+        DataCell(
+          Text(
+            '\$${(qty * price).toStringAsFixed(2)}',
+            style: TextStyle(fontWeight: FontWeight.bold),
+          ),
+        ),
+        DataCell(
+          IconButton(
+            onPressed: () {},
+            icon: const Icon(Icons.close, size: 14),
+            visualDensity: VisualDensity.compact,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _subDataRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 110,
+            child: Text(
+              label,
+              style: TextStyle(fontSize: 12, color: Colors.white38),
+            ),
+          ),
+          Expanded(child: Text(value, style: const TextStyle(fontSize: 13))),
+        ],
+      ),
+    );
+  }
+
+  Widget _totalRow(
+    String label,
+    String value, {
+    bool bold = false,
+    bool large = false,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: large ? 15 : 13,
+              fontWeight: bold ? FontWeight.bold : FontWeight.normal,
+            ),
+          ),
+          const Spacer(),
+          Text(
+            value,
+            style: TextStyle(
+              fontSize: large ? 18 : 13,
+              fontWeight: bold ? FontWeight.bold : FontWeight.normal,
+              color: bold ? Colors.green[300] : null,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _permChip(String field, bool canView, bool canEdit) {
+    final color = !canView
+        ? Colors.red
+        : (canEdit ? Colors.green : Colors.orange);
+    final label = !canView ? 'hidden' : (canEdit ? 'edit' : 'read');
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Text.rich(
+        TextSpan(
+          children: [
+            TextSpan(
+              text: '$field ',
+              style: TextStyle(fontSize: 11, color: Colors.white70),
+            ),
+            TextSpan(
+              text: label,
+              style: TextStyle(
+                fontSize: 10,
+                color: color,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class ListView2 extends StatefulWidget {
+  final String title;
+  final List<String> columns;
+  final List<List<String>> rows;
+  final void Function(String, Widget, [IconData])? onNavigate;
+  final bool mockup;
+  const ListView2({
+    super.key,
+    required this.title,
+    required this.columns,
+    required this.rows,
+    this.onNavigate,
+    this.mockup = false,
+  });
+
+  @override
+  State<ListView2> createState() => _ListView2State();
+}
+
+class _ListView2State extends State<ListView2> {
+  int? _selectedRow;
+
+  @override
+  Widget build(BuildContext context) => widget.mockup
+      ? MockupFrame(what: '${widget.title} list', child: _buildList(context))
+      : _buildList(context);
+
+  Widget _buildList(BuildContext context) {
+    return Column(
+      children: [
+        // Toolbar
+        Container(
+          height: 44,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          decoration: BoxDecoration(
+            border: Border(bottom: BorderSide(color: Colors.white10)),
+          ),
+          child: Row(
+            children: [
+              Text(
+                '${widget.rows.length} records',
+                style: TextStyle(fontSize: 13, color: Colors.white38),
+              ),
+              const Spacer(),
+              SizedBox(
+                width: 200,
+                height: 32,
+                child: TextField(
+                  decoration: InputDecoration(
+                    hintText: 'Search ${widget.title.toLowerCase()}...',
+                    hintStyle: const TextStyle(fontSize: 12),
+                    prefixIcon: const Icon(Icons.search, size: 16),
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(vertical: 6),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton(
+                onPressed: () {},
+                icon: const Icon(Icons.filter_list, size: 18),
+                tooltip: 'Filter',
+                visualDensity: VisualDensity.compact,
+              ),
+              IconButton(
+                onPressed: () {},
+                icon: const Icon(Icons.sort, size: 18),
+                tooltip: 'Sort',
+                visualDensity: VisualDensity.compact,
+              ),
+              const SizedBox(width: 8),
+              SegmentedButton<String>(
+                segments: const [
+                  ButtonSegment(
+                    value: 'grid',
+                    icon: Icon(Icons.view_list, size: 16),
+                  ),
+                  ButtonSegment(
+                    value: 'form',
+                    icon: Icon(Icons.dynamic_form, size: 16),
+                  ),
+                ],
+                selected: const {'grid'},
+                onSelectionChanged: (_) {},
+                style: ButtonStyle(
+                  visualDensity: VisualDensity.compact,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ),
+              const SizedBox(width: 8),
+              FilledButton.icon(
+                onPressed: () {},
+                icon: const Icon(Icons.add, size: 16),
+                label: const Text('New', style: TextStyle(fontSize: 12)),
+                style: FilledButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            ],
+          ),
+        ),
+        // Grid
+        Expanded(
+          child: SingleChildScrollView(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: DataTable(
+                headingRowHeight: 36,
+                dataRowMinHeight: 36,
+                dataRowMaxHeight: 36,
+                columnSpacing: 32,
+                headingTextStyle: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white54,
+                ),
+                dataTextStyle: const TextStyle(fontSize: 13),
+                columns: widget.columns
+                    .map((c) => DataColumn(label: Text(c)))
+                    .toList(),
+                rows: widget.rows.asMap().entries.map((entry) {
+                  final i = entry.key;
+                  final row = entry.value;
+                  return DataRow(
+                    selected: _selectedRow == i,
+                    onSelectChanged: (_) {
+                      if (_selectedRow == i && widget.onNavigate != null) {
+                        // Double-click / re-click opens detail
+                        final record = Map.fromIterables(widget.columns, row);
+                        widget.onNavigate!(
+                          '${row[0]}',
+                          RecordDetailView(
+                            title: row.length > 1 ? row[0] : 'Record',
+                            collection: widget.title,
+                            fields: record,
+                            onNavigate: widget.onNavigate,
+                          ),
+                          Icons.article,
+                        );
+                      }
+                      setState(() => _selectedRow = i);
+                    },
+                    cells: row.map((cell) {
+                      if ([
+                        'hot',
+                        'warm',
+                        'cold',
+                        'customer',
+                        'high',
+                        'critical',
+                        'low',
+                        'normal',
+                        'open',
+                        'in_progress',
+                        'active',
+                        'draft',
+                      ].contains(cell)) {
+                        return DataCell(_chip(cell));
+                      }
+                      if (cell == 'today') {
+                        return DataCell(
+                          Text(
+                            cell,
+                            style: TextStyle(
+                              color: Colors.red[300],
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13,
+                            ),
+                          ),
+                        );
+                      }
+                      return DataCell(Text(cell));
+                    }).toList(),
+                  );
+                }).toList(),
+              ),
+            ),
+          ),
+        ),
+        // Pagination
+        Container(
+          height: 36,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          decoration: BoxDecoration(
+            border: Border(top: BorderSide(color: Colors.white10)),
+          ),
+          child: Row(
+            children: [
+              Text(
+                'Page 1 of 1',
+                style: TextStyle(fontSize: 12, color: Colors.white38),
+              ),
+              const Spacer(),
+              Text(
+                'Showing 1-${widget.rows.length} of ${widget.rows.length}',
+                style: TextStyle(fontSize: 12, color: Colors.white38),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _chip(String value) {
+    final color = switch (value) {
+      'hot' || 'critical' || 'overdue' => Colors.red,
+      'warm' || 'high' || 'in_progress' => Colors.orange,
+      'customer' || 'active' => Colors.green,
+      'cold' || 'low' || 'draft' => Colors.grey,
+      'open' || 'normal' => Colors.blue,
+      _ => Colors.white54,
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(value, style: TextStyle(fontSize: 11, color: color)),
+    );
+  }
+}
+
+class _ReportCard extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String sub;
+  final VoidCallback onTap;
+  final bool mockup;
+  const _ReportCard({
+    required this.icon,
+    required this.title,
+    required this.sub,
+    required this.onTap,
+    this.mockup = false,
+  });
+
+  @override
+  Widget build(BuildContext context) => mockup
+      ? MockupOutline(radius: 12, child: _card(context))
+      : _card(context);
+
+  Widget _card(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        width: 200,
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surfaceContainerLow,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.white10),
+        ),
+        child: Row(
+          children: [
+            Icon(icon, size: 24, color: Colors.white38),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  Text(
+                    sub,
+                    style: TextStyle(fontSize: 11, color: Colors.white38),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Mockup styling: "planned, not built yet". Deliberately NOT grey (grey means
+// unavailable/locked): a dashed pink "blueprint" outline + MOCKUP tag.
+// ---------------------------------------------------------------------------
+
+const kMockupColor = Color(0xFFF472B6);
+const _mockupTooltip =
+    'Mockup: a design placeholder with sample data. Not built yet and not '
+    'connected to the server.';
+
+class MockupTag extends StatelessWidget {
+  const MockupTag({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: _mockupTooltip,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        decoration: BoxDecoration(
+          // Solid, so the dashed border it sits on doesn't show through.
+          color: const Color(0xFF2A1724),
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(color: kMockupColor.withValues(alpha: 0.6)),
+        ),
+        child: const Text(
+          'MOCKUP',
+          style: TextStyle(
+            fontSize: 9,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 0.8,
+            color: kMockupColor,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Dashed pink outline + MOCKUP tag around a card/tile that isn't built yet.
+class MockupOutline extends StatelessWidget {
+  final Widget child;
+  final double radius;
+  const MockupOutline({super.key, required this.child, this.radius = 10});
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      painter: _DashedRRectPainter(kMockupColor, radius),
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          child,
+          // Sits on the dashed border, clear of the content.
+          const Positioned(top: -9, right: 12, child: MockupTag()),
+        ],
+      ),
+    );
+  }
+}
+
+class _DashedRRectPainter extends CustomPainter {
+  final Color color;
+  final double radius;
+  _DashedRRectPainter(this.color, this.radius);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color.withValues(alpha: 0.75)
+      ..strokeWidth = 1.2
+      ..style = PaintingStyle.stroke;
+    final path = Path()
+      ..addRRect(
+        RRect.fromRectAndRadius(Offset.zero & size, Radius.circular(radius)),
+      );
+    for (final metric in path.computeMetrics()) {
+      for (var d = 0.0; d < metric.length; d += 9) {
+        canvas.drawPath(metric.extractPath(d, d + 5), paint);
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(_DashedRRectPainter old) =>
+      old.color != color || old.radius != radius;
+}
+
+/// A whole screen that is a mockup: pink banner on top, the mockup below.
+class MockupFrame extends StatelessWidget {
+  final Widget child;
+  final String what;
+  const MockupFrame({super.key, required this.child, required this.what});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          decoration: BoxDecoration(
+            color: kMockupColor.withValues(alpha: 0.10),
+            border: const Border(
+              bottom: BorderSide(color: kMockupColor, width: 1),
+            ),
+          ),
+          child: Row(
+            children: [
+              const MockupTag(),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  '$what — design placeholder with sample data. Not built yet; '
+                  'nothing here reads or writes the server.',
+                  style: const TextStyle(fontSize: 12, color: kMockupColor),
+                ),
+              ),
+            ],
+          ),
+        ),
+        Expanded(child: child),
+      ],
+    );
+  }
+}
+
+/// Diagram: the live schema diagram, or the original design mockup.
+class DiagramScreen extends StatefulWidget {
+  const DiagramScreen({super.key});
+
+  @override
+  State<DiagramScreen> createState() => _DiagramScreenState();
+}
+
+class _DiagramScreenState extends State<DiagramScreen> {
+  bool _mockup = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: SegmentedButton<bool>(
+              segments: const [
+                ButtonSegment(
+                  value: false,
+                  label: Text('Live schema'),
+                  icon: Icon(Icons.account_tree_outlined, size: 16),
+                ),
+                ButtonSegment(
+                  value: true,
+                  label: Text('Design mockup'),
+                  icon: Icon(
+                    Icons.draw_outlined,
+                    size: 16,
+                    color: kMockupColor,
+                  ),
+                ),
+              ],
+              selected: {_mockup},
+              onSelectionChanged: (s) => setState(() => _mockup = s.first),
+            ),
+          ),
+        ),
+        Expanded(
+          child: _mockup
+              ? const MockupFrame(what: 'Diagram editor', child: DiagramView())
+              : const SchemaDiagramView(),
+        ),
+      ],
     );
   }
 }

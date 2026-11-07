@@ -341,7 +341,15 @@ class ScrollData {
 
   Map<String, dynamic> get effectivePermissionsStatus {
     final direct = _mapFromNullable(permissionsStatus);
-    if (direct.isNotEmpty) return direct;
+    if (direct.isNotEmpty) {
+      // /permissions/status has no capabilities block; /admin/status does
+      // (e.g. capabilities.identity.session_admin_gates_enabled).
+      final caps = adminStatus?['capabilities'];
+      if (!direct.containsKey('capabilities') && caps is Map) {
+        return {...direct, 'capabilities': caps};
+      }
+      return direct;
+    }
     return _mapAt(const [
       ['permissions'],
       ['permission_status'],
