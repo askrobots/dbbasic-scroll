@@ -1103,39 +1103,55 @@ class _MainShellState extends State<MainShell> {
               }),
               onNavigate: _navigate,
             ),
-            // Admin editing banner when viewing user content in admin mode
+            // Admin editing banner when viewing user content in admin mode.
+            // MOCKUP: a planned per-screen layout designer; Add Field and
+            // Save Layout are not built yet (pink = planned, not grey).
             if (_adminMode && _adminNav < 0 && _current.title != 'Home')
               Container(
                 height: 32,
                 padding: const EdgeInsets.symmetric(horizontal: 16),
-                color: Colors.amber.withOpacity(0.08),
+                decoration: BoxDecoration(
+                  color: kMockupColor.withValues(alpha: 0.08),
+                  border: Border(
+                    bottom: BorderSide(
+                      color: kMockupColor.withValues(alpha: 0.5),
+                    ),
+                  ),
+                ),
                 child: Row(
                   children: [
-                    Icon(Icons.edit, size: 14, color: Colors.amber),
+                    const MockupTag(),
+                    const SizedBox(width: 8),
+                    const Icon(Icons.edit, size: 14, color: kMockupColor),
                     const SizedBox(width: 6),
-                    Text(
-                      'Admin Edit Mode — click any field to configure it',
-                      style: TextStyle(fontSize: 12, color: Colors.amber),
+                    const Expanded(
+                      child: Text(
+                        'Admin Edit Mode — click any field to configure it',
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 12, color: kMockupColor),
+                      ),
                     ),
-                    const Spacer(),
                     TextButton.icon(
                       onPressed: () {},
-                      icon: Icon(Icons.add, size: 14),
-                      label: Text('Add Field', style: TextStyle(fontSize: 12)),
+                      icon: const Icon(Icons.add, size: 14),
+                      label: const Text(
+                        'Add Field',
+                        style: TextStyle(fontSize: 12),
+                      ),
                       style: TextButton.styleFrom(
-                        foregroundColor: Colors.amber,
+                        foregroundColor: kMockupColor,
                         visualDensity: VisualDensity.compact,
                       ),
                     ),
                     TextButton.icon(
                       onPressed: () {},
-                      icon: Icon(Icons.save, size: 14),
-                      label: Text(
+                      icon: const Icon(Icons.save, size: 14),
+                      label: const Text(
                         'Save Layout',
                         style: TextStyle(fontSize: 12),
                       ),
                       style: TextButton.styleFrom(
-                        foregroundColor: Colors.amber,
+                        foregroundColor: kMockupColor,
                         visualDensity: VisualDensity.compact,
                       ),
                     ),
