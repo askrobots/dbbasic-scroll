@@ -634,6 +634,21 @@ No markdown, no backticks, no explanations. Only JSON.''';
     );
   }
 
+  /// DELETE through the permission-enforced user route (works for an API
+  /// key or a session that may write the record; measured on 6707021).
+  Future<Map<String, dynamic>> deleteUserCollectionRecord(
+    String collection,
+    String recordId,
+  ) {
+    return rawRequest(
+      'DELETE',
+      _objUrl(
+        'collections/${_pathSegment(collection)}/records/'
+        '${_pathSegment(recordId)}',
+      ),
+    );
+  }
+
   Future<Map<String, dynamic>> createUserCollectionRecord(
     String collection,
     Map<String, dynamic> record,

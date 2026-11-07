@@ -253,6 +253,40 @@ void main() {
             findsOneWidget,
             'the note created from Home is in the table',
           );
+          // Edit it through the schema form (a session can read schemas).
+          if (find.text('home note $stamp').evaluate().isNotEmpty) {
+            await tester.tap(find.text('home note $stamp'));
+            await pumpUntilFound(tester, find.text('Edit'));
+            await tester.tap(find.text('Edit'));
+            await pumpUntilFound(tester, find.text('Save Record'));
+            final field = find.descendant(
+              of: find.byType(AlertDialog),
+              matching: find.byWidgetPredicate(
+                (w) =>
+                    w is TextField &&
+                    (w.decoration?.labelText ?? '').toLowerCase().contains(
+                      'content',
+                    ),
+              ),
+            );
+            await tester.enterText(field.first, 'home note $stamp edited');
+            await tester.tap(find.text('Save Record'));
+            await pumpFor(tester, const Duration(seconds: 3));
+            final after = await ScrollAPI().listUserCollectionRecords('notes');
+            final rows = ((after['body'] as Map)['records'] as List)
+                .whereType<Map>()
+                .where((r) => r['content'] == 'home note $stamp edited')
+                .toList();
+            if (rows.length != 1 || rows.first['owner_id'] != 'dan') {
+              failures.add('[Query] schema-form edit reached the server');
+            }
+            want(
+              label,
+              find.text('home note $stamp edited'),
+              findsOneWidget,
+              'table reloads after the edit',
+            );
+          }
         case 'Diagram':
           want(
             label,

@@ -309,10 +309,22 @@ class _SchemaRecordFormDialogState extends State<_SchemaRecordFormDialog> {
     final collection = field.relationCollection;
     if (collection == null || _relationsLoading.contains(field.name)) return;
     _relationsLoading.add(field.name);
-    final records = await ScrollAPI().listAdminCollectionRecords(
+    var records = await ScrollAPI().listAdminCollectionRecords(
       collection,
       limit: 100,
     );
+    if (records.isEmpty) {
+      // An API key / non-admin session can't read the admin route; the
+      // user route returns the records this credential may see.
+      final res = await ScrollAPI().listUserCollectionRecords(
+        collection,
+        limit: 100,
+      );
+      final body = res['body'];
+      if (body is Map && body['records'] is List) {
+        records = body['records'] as List;
+      }
+    }
     if (!mounted) return;
     setState(() {
       _relationOptions[field.name] = [

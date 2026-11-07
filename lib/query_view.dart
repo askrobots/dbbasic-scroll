@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'api.dart';
+import 'home_collections.dart';
 
 /// One condition. Forms: `field=value`, `field!=value`, `field~text`
 /// (contains), `field>n`, `field<n`, or bare text (any field contains).
@@ -298,6 +299,19 @@ class _QueryViewState extends State<QueryView> {
                 label: const Text('Run'),
               ),
               OutlinedButton.icon(
+                onPressed: _collection == null
+                    ? null
+                    : () async {
+                        final id = await createServerRecord(
+                          context,
+                          _collection!,
+                        );
+                        if (id != null && mounted) await _run();
+                      },
+                icon: const Icon(Icons.add, size: 16),
+                label: const Text('New'),
+              ),
+              OutlinedButton.icon(
                 onPressed: result.isEmpty
                     ? null
                     : () async {
@@ -351,6 +365,7 @@ class _QueryViewState extends State<QueryView> {
                     child: SingleChildScrollView(
                       scrollDirection: Axis.horizontal,
                       child: DataTable(
+                        showCheckboxColumn: false,
                         headingRowHeight: 36,
                         dataRowMinHeight: 30,
                         dataRowMaxHeight: 30,
@@ -375,6 +390,15 @@ class _QueryViewState extends State<QueryView> {
                         rows: [
                           for (final r in result.take(1000))
                             DataRow(
+                              // Click a row: view it, then Edit or Delete.
+                              onSelectChanged: (_) async {
+                                final changed = await showServerRecord(
+                                  context,
+                                  _collection!,
+                                  r,
+                                );
+                                if (changed && mounted) await _run();
+                              },
                               cells: [
                                 for (final c in columns)
                                   DataCell(

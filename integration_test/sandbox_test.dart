@@ -114,6 +114,75 @@ void main() {
     expect(find.text('Session expired'), findsNothing);
   });
 
+  testWidgets('API key (real server): create, edit and delete a note from '
+      'Home and its Notes view', (tester) async {
+    if (!configured) return markTestSkipped('sandbox not configured');
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final text1 = 'key note $stamp';
+    final text2 = 'key note $stamp (edited)';
+    Finder dialogField(String label) => find.descendant(
+      of: find.byType(AlertDialog),
+      matching: find.byWidgetPredicate(
+        (w) => w is TextField && w.decoration?.labelText == label,
+      ),
+    );
+    Future<List<Map>> serverNotes() async {
+      final res = await ScrollAPI().listUserCollectionRecords('notes');
+      return ((res['body'] as Map)['records'] as List)
+          .whereType<Map>()
+          .toList();
+    }
+
+    await connectVia(tester, 'Sandbox key', _apiKey);
+
+    // Create (an API key can't read schemas: one-field dialog).
+    await tester.tap(find.text('New Note'));
+    await pumpUntilFound(tester, dialogField('content'));
+    await tester.enterText(dialogField('content'), text1);
+    await tester.tap(find.text('Create'));
+    await pumpUntilFound(tester, find.text('Created in notes'));
+    expect(
+      (await serverNotes()).where((r) => r['content'] == text1),
+      hasLength(1),
+    );
+
+    // Open the Notes view (real records), click the new note.
+    await pumpFor(tester, const Duration(seconds: 2));
+    await tester.ensureVisible(find.text('Notes').first);
+    await tester.tap(find.text('Notes').first);
+    await pumpUntilFound(tester, find.text(text1));
+    await tester.tap(find.text(text1));
+    await pumpUntilFound(tester, find.text('Edit'));
+
+    // Edit (field-by-field editor, only changed fields are sent).
+    await tester.tap(find.text('Edit'));
+    await pumpUntilFound(tester, dialogField('content'));
+    await tester.enterText(dialogField('content'), text2);
+    await tester.tap(find.text('Save Record'));
+    // The closing dialog still shows the edited text; wait it out.
+    await pumpUntilGone(tester, find.byType(AlertDialog));
+    await pumpUntilFound(tester, find.text(text2));
+    final edited = (await serverNotes()).where((r) => r['content'] == text2);
+    expect(edited, hasLength(1), reason: 'the edit reached the server');
+    expect(edited.first['owner_id'], 'dan', reason: 'ownership untouched');
+
+    // Delete with confirmation.
+    await tester.tap(find.text(text2));
+    await pumpUntilFound(tester, find.text('Delete'));
+    await tester.tap(find.text('Delete'));
+    await pumpUntilFound(tester, find.text('Delete Record'));
+    await tester.tap(find.text('Delete Record'));
+    await pumpUntilFound(tester, find.text('Deleted'));
+    expect(
+      (await serverNotes()).where(
+        (r) => r['content'] == text1 || r['content'] == text2,
+      ),
+      isEmpty,
+      reason: 'the delete reached the server',
+    );
+    expect(find.text('Session expired'), findsNothing);
+  });
+
   testWidgets('admin token (real server): admin screens unlocked', (
     tester,
   ) async {

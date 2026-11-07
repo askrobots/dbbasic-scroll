@@ -28,7 +28,18 @@ Future<void> pumpUntilFound(
     await tester.pump(const Duration(milliseconds: 100));
     if (finder.evaluate().isNotEmpty) return;
   }
-  fail(reason ?? 'Timed out waiting for $finder');
+  // Say what IS showing: text inside open dialogs and snackbars only (never
+  // page content, so live runs don't dump records into logs).
+  final showing = <String>[
+    for (final scope in [find.byType(AlertDialog), find.byType(SnackBar)])
+      for (final e
+          in find.descendant(of: scope, matching: find.byType(Text)).evaluate())
+        if ((e.widget as Text).data case final t?) t,
+  ];
+  fail(
+    '${reason ?? 'Timed out waiting for $finder'}'
+    '${showing.isEmpty ? '' : ' — dialogs/snackbars showing: $showing'}',
+  );
 }
 
 /// Pump for a fixed real duration (lets background loads finish).
@@ -74,4 +85,18 @@ Future<void> tapNavItem(WidgetTester tester, String label) async {
   );
   await tester.pump();
   await tester.tap(item);
+}
+
+/// Pump until [finder] matches nothing (e.g. a dialog finished closing).
+Future<void> pumpUntilGone(
+  WidgetTester tester,
+  Finder finder, {
+  Duration timeout = const Duration(seconds: 10),
+}) async {
+  final deadline = DateTime.now().add(timeout);
+  while (DateTime.now().isBefore(deadline)) {
+    await tester.pump(const Duration(milliseconds: 100));
+    if (finder.evaluate().isEmpty) return;
+  }
+  fail('Still showing after $timeout: $finder');
 }

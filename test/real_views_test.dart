@@ -141,6 +141,22 @@ void main() {
       ]);
     });
 
+    test('edits never send server-owned or read-only fields', () {
+      final payload = editablePayload(
+        {
+          'id': 'n1',
+          'owner_id': 'dan',
+          'created_at': '2026-11-06T00:00:00Z',
+          'updated_at': '2026-11-06T00:00:00Z',
+          'content': 'hello',
+          'computed_total': 3,
+          'is_public': 'false',
+        },
+        readOnly: {'computed_total'},
+      );
+      expect(payload, {'content': 'hello', 'is_public': 'false'});
+    });
+
     test('titles and the one-field create fallback', () {
       expect(titleForCollection('feed_posts'), 'Feed Posts');
       expect(primaryFieldFor('notes'), 'content');
