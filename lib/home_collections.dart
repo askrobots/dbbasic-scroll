@@ -9,6 +9,9 @@ import 'package:flutter/material.dart';
 import 'api.dart';
 import 'query_view.dart';
 import 'schema_form.dart';
+import 'server_apps.dart';
+import 'server_ui.dart';
+import 'view_renderer.dart';
 
 /// The desk apps' collections, shown first and offered as quick actions.
 const preferredCollections = [
@@ -108,13 +111,39 @@ typedef NavigateFn = void Function(String, Widget, [IconData]);
 /// "VIEWS" rows for the server's collections.
 class ServerCollectionViews extends StatelessWidget {
   final NavigateFn? onNavigate;
+
+  /// Opens a collection as the server's generated page (its `views` record
+  /// or the schema-driven list). Without it, rows fall back to Query.
+  final ServerUiNav? nav;
   final int max;
-  const ServerCollectionViews({super.key, this.onNavigate, this.max = 10});
+  const ServerCollectionViews({
+    super.key,
+    this.onNavigate,
+    this.nav,
+    this.max = 10,
+  });
+
+  void _open(BuildContext context, String collection) {
+    final n = nav;
+    if (n != null) {
+      n.open(context, '/$collection', title: titleForCollection(collection));
+      return;
+    }
+    onNavigate?.call(
+      titleForCollection(collection),
+      QueryView(initialCollection: collection, autoRun: true),
+      _iconFor(collection),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<List<CollectionCount>>(
-      future: ServerCollectionCatalog.load(),
+    final grid = TileModeScope.of(context);
+    return FutureBuilder<List<Object?>>(
+      future: Future.wait([
+        ServerCollectionCatalog.load(),
+        NavMenuCache.load(),
+      ]),
       builder: (context, snap) {
         if (!snap.hasData) {
           return const Padding(
@@ -122,11 +151,51 @@ class ServerCollectionViews extends StatelessWidget {
             child: LinearProgressIndicator(minHeight: 2),
           );
         }
-        final all = snap.data!;
-        if (all.isEmpty) {
+        final counts = snap.data![0] as List<CollectionCount>;
+        final menu = snap.data![1] as NavMenu?;
+        // Collections the APPS launcher already opens aren't repeated here.
+        final asApps = <String>{
+          for (final g in menu?.groups ?? const <NavGroup>[])
+            for (final e in g.entries)
+              e.path.split('/').where((x) => x.isNotEmpty).firstOrNull ?? '',
+        };
+        final all = counts.where((c) => !asApps.contains(c.name)).toList();
+        if (counts.isEmpty) {
           return const Text(
             'This credential cannot read any collections on this server.',
             style: TextStyle(color: Colors.white54),
+          );
+        }
+        String sub(CollectionCount c) =>
+            '${c.total} record${c.total == 1 ? '' : 's'}';
+        if (grid) {
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Wrap(
+              spacing: 12,
+              runSpacing: 12,
+              children: [
+                for (final c in all.take(max))
+                  IconTile(
+                    icon: _iconFor(c.name),
+                    label: titleForCollection(c.name),
+                    sub: sub(c),
+                    tooltip: c.name,
+                    onTap: () => _open(context, c.name),
+                  ),
+                IconTile(
+                  icon: Icons.manage_search_outlined,
+                  label: 'All data',
+                  sub: '${counts.length} collections',
+                  tooltip: 'Every readable collection, in Query',
+                  onTap: () => onNavigate?.call(
+                    'Query',
+                    const QueryView(),
+                    Icons.manage_search_outlined,
+                  ),
+                ),
+              ],
+            ),
           );
         }
         return Column(
@@ -136,27 +205,22 @@ class ServerCollectionViews extends StatelessWidget {
                 context,
                 icon: _iconFor(c.name),
                 title: titleForCollection(c.name),
-                sub: '${c.total} record${c.total == 1 ? '' : 's'} · ${c.name}',
+                sub: '${sub(c)} · ${c.name}',
                 count: '${c.total}',
-                onTap: () => onNavigate?.call(
-                  titleForCollection(c.name),
-                  QueryView(initialCollection: c.name, autoRun: true),
-                  _iconFor(c.name),
-                ),
+                onTap: () => _open(context, c.name),
               ),
-            if (all.length > max)
-              _row(
-                context,
-                icon: Icons.manage_search_outlined,
-                title: 'All collections',
-                sub: '${all.length} readable collections · open Query',
-                count: '${all.length}',
-                onTap: () => onNavigate?.call(
-                  'Query',
-                  const QueryView(),
-                  Icons.manage_search_outlined,
-                ),
+            _row(
+              context,
+              icon: Icons.manage_search_outlined,
+              title: 'All collections',
+              sub: '${counts.length} readable collections · open Query',
+              count: '${counts.length}',
+              onTap: () => onNavigate?.call(
+                'Query',
+                const QueryView(),
+                Icons.manage_search_outlined,
               ),
+            ),
           ],
         );
       },
@@ -219,13 +283,13 @@ String primaryFieldFor(String collection) => switch (collection) {
 /// Returns the created record id, or null if cancelled/failed.
 Future<String?> createServerRecord(
   BuildContext context,
-  String collection,
-) async {
+  String collection, {
+  Map<String, dynamic> fixed = const {},
+}) async {
   final api = ScrollAPI();
-  final schema =
-      await api.getAdminSchema(collection) ?? await api.getSchema(collection);
+  final schema = await _readableSchema(collection);
   if (!context.mounted) return null;
-  final spec = SchemaFormSpec.fromSchema(schema);
+  final spec = _formSpec(schema, hide: fixed.keys.toSet());
   Map<String, dynamic>? record;
   if (spec.hasFields) {
     final result = await showSchemaRecordFormDialog(
@@ -233,7 +297,10 @@ Future<String?> createServerRecord(
       collection: collection,
       spec: spec,
     );
-    if (result is Map<String, dynamic>) record = result;
+    if (result is Map<String, dynamic>) {
+      // `fixed` values (e.g. the parent project) are locked, not asked for.
+      record = {...result, ...fixed}..remove('id');
+    }
     if (result == null) return null;
   }
   if (record == null) {
@@ -249,7 +316,7 @@ Future<String?> createServerRecord(
     );
     final text = values?[field]?.trim() ?? '';
     if (text.isEmpty) return null;
-    record = {field: text};
+    record = {field: text, ...fixed};
   }
   final res = await api.createUserCollectionRecord(collection, record);
   final status = res['status'];
@@ -292,10 +359,26 @@ Map<String, dynamic> editablePayload(
       e.key: e.value,
 };
 
-Future<Map<String, dynamic>?> _readableSchema(String collection) async {
-  final api = ScrollAPI();
-  return await api.getAdminSchema(collection) ??
-      await api.getSchema(collection);
+/// The member-level /api/schema first (an API key can read it), then the
+/// admin and legacy routes.
+Future<Map<String, dynamic>?> _readableSchema(String collection) =>
+    fetchSchemaDoc(collection);
+
+/// The schema form minus fields a person never types: server-owned ones
+/// (id, owner_id, timestamps; the server stamps them) and [hide].
+SchemaFormSpec _formSpec(
+  Map<String, dynamic>? schema, {
+  Set<String> hide = const {},
+}) {
+  final spec = SchemaFormSpec.fromSchema(schema);
+  return SchemaFormSpec(
+    fields: [
+      for (final f in spec.fields)
+        if (!serverOwnedFields.contains(f.name) && !hide.contains(f.name)) f,
+    ],
+    listMode: spec.listMode,
+    listFields: spec.listFields,
+  );
 }
 
 void _toast(BuildContext context, String text) {
@@ -328,7 +411,7 @@ Future<bool> editServerRecord(
   if (id.isEmpty) return false;
   final schema = await _readableSchema(collection);
   if (!context.mounted) return false;
-  final spec = SchemaFormSpec.fromSchema(schema);
+  final spec = _formSpec(schema);
   Map<String, dynamic>? changes;
   if (spec.hasFields) {
     final result = await showSchemaRecordFormDialog(

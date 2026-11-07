@@ -117,7 +117,16 @@ class SchemaFieldSpec {
               (state, moves) => MapEntry(
                 state.toString(),
                 moves is List
-                    ? moves.map((move) => move.toString()).toList()
+                    ? [
+                        // A move is "to" or a guarded {"to", "when"}; the
+                        // guard ($user_id, ...) is checked by the server on
+                        // write, so offer the move and let it decide.
+                        for (final move in moves)
+                          if (move is Map && move['to'] != null)
+                            move['to'].toString()
+                          else if (move is! Map)
+                            move.toString(),
+                      ]
                     : const <String>[],
               ),
             )
@@ -190,9 +199,12 @@ class SchemaFormSpec {
         final rank = <String, int>{
           for (var i = 0; i < order.length; i++) order[i].toString(): i,
         };
+        // Original positions captured up front: looking them up mid-sort
+        // (indexOf) reads a half-sorted list and shuffles unranked fields.
+        final original = {for (var i = 0; i < specs.length; i++) specs[i]: i};
         specs.sort((a, b) {
-          final ra = rank[a.name] ?? (rank.length + specs.indexOf(a));
-          final rb = rank[b.name] ?? (rank.length + specs.indexOf(b));
+          final ra = rank[a.name] ?? (rank.length + original[a]!);
+          final rb = rank[b.name] ?? (rank.length + original[b]!);
           return ra.compareTo(rb);
         });
       }

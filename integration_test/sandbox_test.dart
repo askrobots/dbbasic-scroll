@@ -11,6 +11,7 @@ import 'dart:io';
 
 import 'package:dbbasic_scroll/api.dart';
 import 'package:dbbasic_scroll/main.dart';
+import 'package:dbbasic_scroll/server_apps.dart';
 import 'package:dbbasic_scroll/server_profiles.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -120,10 +121,12 @@ void main() {
     final stamp = DateTime.now().millisecondsSinceEpoch;
     final text1 = 'key note $stamp';
     final text2 = 'key note $stamp (edited)';
-    Finder dialogField(String label) => find.descendant(
+    Finder dialogField(String labelPart) => find.descendant(
       of: find.byType(AlertDialog),
       matching: find.byWidgetPredicate(
-        (w) => w is TextField && w.decoration?.labelText == label,
+        (w) =>
+            w is TextField &&
+            (w.decoration?.labelText ?? '').toLowerCase().contains(labelPart),
       ),
     );
     Future<List<Map>> serverNotes() async {
@@ -135,29 +138,35 @@ void main() {
 
     await connectVia(tester, 'Sandbox key', _apiKey);
 
-    // Create (an API key can't read schemas: one-field dialog).
+    // Create: an API key reads the member schema (/api/schema), so this is
+    // the real schema form, minus server-owned fields.
     await tester.tap(find.text('New Note'));
     await pumpUntilFound(tester, dialogField('content'));
-    await tester.enterText(dialogField('content'), text1);
-    await tester.tap(find.text('Create'));
+    expect(dialogField('owner'), findsNothing);
+    await tester.enterText(dialogField('content').first, text1);
+    await tester.tap(find.text('Create Record'));
     await pumpUntilFound(tester, find.text('Created in notes'));
     expect(
       (await serverNotes()).where((r) => r['content'] == text1),
       hasLength(1),
     );
 
-    // Open the Notes view (real records), click the new note.
-    await pumpFor(tester, const Duration(seconds: 2));
-    await tester.ensureVisible(find.text('Notes').first);
-    await tester.tap(find.text('Notes').first);
+    // The Notes app (the server's Notes view), click the new note: its page.
+    await pumpUntilGone(tester, find.byType(AlertDialog));
+    final notesApp = find.descendant(
+      of: find.byType(ServerAppsSection),
+      matching: find.text('Notes'),
+    );
+    await tester.ensureVisible(notesApp);
+    await tester.tap(notesApp);
     await pumpUntilFound(tester, find.text(text1));
-    await tester.tap(find.text(text1));
+    await tester.tap(find.text(text1).first);
     await pumpUntilFound(tester, find.text('Edit'));
 
-    // Edit (field-by-field editor, only changed fields are sent).
+    // Edit through the schema form; only editable fields are sent.
     await tester.tap(find.text('Edit'));
     await pumpUntilFound(tester, dialogField('content'));
-    await tester.enterText(dialogField('content'), text2);
+    await tester.enterText(dialogField('content').first, text2);
     await tester.tap(find.text('Save Record'));
     // The closing dialog still shows the edited text; wait it out.
     await pumpUntilGone(tester, find.byType(AlertDialog));
@@ -166,13 +175,11 @@ void main() {
     expect(edited, hasLength(1), reason: 'the edit reached the server');
     expect(edited.first['owner_id'], 'dan', reason: 'ownership untouched');
 
-    // Delete with confirmation.
-    await tester.tap(find.text(text2));
-    await pumpUntilFound(tester, find.text('Delete'));
+    // Delete from the page, with confirmation.
     await tester.tap(find.text('Delete'));
     await pumpUntilFound(tester, find.text('Delete Record'));
     await tester.tap(find.text('Delete Record'));
-    await pumpUntilFound(tester, find.text('Deleted'));
+    await pumpUntilFound(tester, find.text('Deleted.'));
     expect(
       (await serverNotes()).where(
         (r) => r['content'] == text1 || r['content'] == text2,

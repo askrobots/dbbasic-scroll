@@ -174,7 +174,7 @@ void main() {
     await pumpFor(tester, const Duration(milliseconds: 300));
     want(
       'Home',
-      find.text('Needs a platform URL (AskRobots)'),
+      find.text('needs a platform'),
       findsWidgets,
       'platform tiles explain they need a platform',
     );

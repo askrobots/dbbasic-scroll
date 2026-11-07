@@ -8,6 +8,9 @@ import 'api.dart';
 import 'data.dart';
 import 'diagram_view.dart';
 import 'home_collections.dart';
+import 'mockup.dart';
+import 'server_apps.dart';
+import 'view_renderer.dart';
 import 'query_view.dart';
 import 'realtime.dart';
 import 'schema_form.dart';
@@ -1977,6 +1980,13 @@ class SwitchboardView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final d = ScrollData();
+    HomeTileMode.ensureLoaded();
+    // Server paths open natively: /shell is the same conversation as
+    // Scroll's AI Chat (shared /api/ai/chat + shell_preferences).
+    final nav = ServerUiNav(
+      navigate: onNavigate,
+      native: (path) => path == '/shell' ? const AIChatView() : null,
+    );
     final hour = DateTime.now().hour;
     final greeting = hour < 12
         ? 'Good morning'
@@ -1998,6 +2008,9 @@ class SwitchboardView extends StatelessWidget {
           const SizedBox(height: 24),
           _OperatorStatusPanel(data: d, onNavigate: onNavigate),
           const SizedBox(height: 32),
+
+          // The server's own app launcher (same doors as its web home).
+          ServerAppsSection(nav: nav),
 
           // Quick actions
           _sectionLabel('QUICK ACTIONS'),
@@ -2147,247 +2160,304 @@ class SwitchboardView extends StatelessWidget {
           const SizedBox(height: 36),
 
           // Views
-          _sectionLabel('VIEWS'),
-          const SizedBox(height: 12),
-          if (!ScrollAPI().hasPlatform)
-            ServerCollectionViews(onNavigate: onNavigate),
-          _ViewTile(
-            icon: Icons.people,
-            title: 'Contacts',
-            sub: ScrollAPI().hasPlatform
-                ? '${d.contactCount} contacts'
-                : 'Needs a platform URL (AskRobots)',
-            count: ScrollAPI().hasPlatform ? '${d.contactCount}' : '—',
-            onTap: () {
-              onNavigate?.call(
-                'Contacts',
-                LiveListView(
-                  title: 'Contacts',
-                  collection: 'contacts',
-                  columns: const [
-                    'Name',
-                    'Email',
-                    'Organization',
-                    'Phone',
-                    'Status',
-                  ],
-                  fields: const [
-                    'full_name',
-                    'email',
-                    'organization',
-                    'phone_numbers.0.number',
-                    'lead_status',
-                  ],
-                  onNavigate: onNavigate,
-                ),
-                Icons.people,
-              );
-            },
-          ),
-          _ViewTile(
-            icon: Icons.check_circle_outline,
-            title: 'My Tasks',
-            sub: ScrollAPI().hasPlatform
-                ? '${d.taskCount} tasks'
-                : 'Needs a platform URL (AskRobots)',
-            count: ScrollAPI().hasPlatform ? '${d.taskCount}' : '—',
-            onTap: () {
-              onNavigate?.call(
-                'My Tasks',
-                LiveListView(
-                  title: 'My Tasks',
-                  collection: 'tasks',
-                  columns: const ['Title', 'Status', 'Urgency', 'Created'],
-                  fields: const ['title', 'status', 'urgency', 'created_at'],
-                  onNavigate: onNavigate,
-                ),
-                Icons.check_circle_outline,
-              );
-            },
-          ),
-          _ViewTile(
-            icon: Icons.shopping_cart,
-            title: 'Recent Orders',
-            mockup: true,
-            sub: '341 total, 18 this week',
-            count: '341',
-            onTap: () {
-              onNavigate?.call(
-                'Recent Orders',
-                ListView2(
-                  mockup: true,
-                  title: 'Orders',
-                  columns: const [
-                    'Order #',
-                    'Customer',
-                    'Items',
-                    'Total',
-                    'Status',
-                  ],
-                  rows: List.generate(
-                    8,
-                    (i) => [
-                      'ORD-${2041 + i}',
-                      [
-                        'Acme Corp',
-                        'TechStart',
-                        'DataFlow',
-                        'CloudNine',
-                        'NetWorks',
-                        'ByteSize',
-                        'MidTech',
-                        'CoreData',
-                      ][i],
-                      '${(i % 4) + 1} items',
-                      '\$${((i + 1) * 299).toStringAsFixed(2)}',
-                      i < 2 ? 'shipped' : (i < 5 ? 'processing' : 'pending'),
+          ValueListenableBuilder<bool>(
+            valueListenable: HomeTileMode.grid,
+            builder: (context, grid, _) => TileModeScope(
+              grid: grid,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      _sectionLabel('VIEWS'),
+                      const SizedBox(width: 8),
+                      IconButton(
+                        tooltip: grid ? 'Show as a list' : 'Show as icons',
+                        visualDensity: VisualDensity.compact,
+                        iconSize: 18,
+                        icon: Icon(grid ? Icons.view_list : Icons.grid_view),
+                        onPressed: () => HomeTileMode.set(!grid),
+                      ),
                     ],
                   ),
-                  onNavigate: onNavigate,
-                ),
-                Icons.shopping_cart,
-              );
-            },
-          ),
-          _ViewTile(
-            icon: Icons.receipt_long,
-            title: 'Invoices',
-            mockup: true,
-            sub: '5 unpaid, 2 overdue',
-            count: '5',
-            alert: true,
-            onTap: () {
-              onNavigate?.call(
-                'Invoices',
-                ListView2(
-                  mockup: true,
-                  title: 'Invoices',
-                  columns: const [
-                    'Invoice #',
-                    'Customer',
-                    'Amount',
-                    'Due',
-                    'Status',
-                  ],
-                  rows: [
-                    [
-                      'INV-1043',
-                      'Acme Corp',
-                      '\$2,118.45',
-                      '2026-05-08',
-                      'draft',
-                    ],
-                    [
-                      'INV-1042',
-                      'TechStart',
-                      '\$890.00',
-                      '2026-04-15',
-                      'overdue',
-                    ],
-                    [
-                      'INV-1041',
-                      'DataFlow',
-                      '\$3,450.00',
-                      '2026-04-10',
-                      'overdue',
-                    ],
-                    [
-                      'INV-1040',
-                      'CloudNine',
-                      '\$1,200.00',
-                      '2026-04-20',
-                      'sent',
-                    ],
-                    ['INV-1039', 'NetWorks', '\$675.00', '2026-04-25', 'sent'],
-                  ],
-                  onNavigate: onNavigate,
-                ),
-                Icons.receipt_long,
-              );
-            },
-          ),
-          _ViewTile(
-            icon: Icons.inventory_2,
-            title: 'Products',
-            mockup: true,
-            sub: '89 active products',
-            count: '89',
-            onTap: () {
-              onNavigate?.call(
-                'Products',
-                ListView2(
-                  mockup: true,
-                  title: 'Products',
-                  columns: const ['Name', 'SKU', 'Price', 'Stock', 'Category'],
-                  rows: List.generate(
-                    8,
-                    (i) => [
-                      [
-                        'Web Hosting',
-                        'SSL Certificate',
-                        'Support Hours',
-                        'Domain Name',
-                        'Email Plan',
-                        'CDN Service',
-                        'Backup Plan',
-                        'API Access',
-                      ][i],
-                      'SKU-${1001 + i}',
-                      '\$${[299, 79, 150, 15, 49, 89, 39, 199][i]}.00',
-                      '${[999, 245, 500, 999, 350, 180, 420, 275][i]}',
-                      [
-                        'hosting',
-                        'security',
-                        'support',
-                        'domains',
-                        'email',
-                        'performance',
-                        'backup',
-                        'api',
-                      ][i],
+                  const SizedBox(height: 12),
+                  if (!ScrollAPI().hasPlatform)
+                    ServerCollectionViews(onNavigate: onNavigate, nav: nav),
+                  _TileGroup(
+                    children: [
+                      _ViewTile(
+                        icon: Icons.people,
+                        title: 'Contacts',
+                        unavailable: !ScrollAPI().hasPlatform,
+                        sub: ScrollAPI().hasPlatform
+                            ? '${d.contactCount} contacts'
+                            : 'Needs a platform URL (AskRobots)',
+                        count: ScrollAPI().hasPlatform
+                            ? '${d.contactCount}'
+                            : '—',
+                        onTap: () {
+                          onNavigate?.call(
+                            'Contacts',
+                            LiveListView(
+                              title: 'Contacts',
+                              collection: 'contacts',
+                              columns: const [
+                                'Name',
+                                'Email',
+                                'Organization',
+                                'Phone',
+                                'Status',
+                              ],
+                              fields: const [
+                                'full_name',
+                                'email',
+                                'organization',
+                                'phone_numbers.0.number',
+                                'lead_status',
+                              ],
+                              onNavigate: onNavigate,
+                            ),
+                            Icons.people,
+                          );
+                        },
+                      ),
+                      _ViewTile(
+                        icon: Icons.check_circle_outline,
+                        title: 'My Tasks',
+                        unavailable: !ScrollAPI().hasPlatform,
+                        sub: ScrollAPI().hasPlatform
+                            ? '${d.taskCount} tasks'
+                            : 'Needs a platform URL (AskRobots)',
+                        count: ScrollAPI().hasPlatform ? '${d.taskCount}' : '—',
+                        onTap: () {
+                          onNavigate?.call(
+                            'My Tasks',
+                            LiveListView(
+                              title: 'My Tasks',
+                              collection: 'tasks',
+                              columns: const [
+                                'Title',
+                                'Status',
+                                'Urgency',
+                                'Created',
+                              ],
+                              fields: const [
+                                'title',
+                                'status',
+                                'urgency',
+                                'created_at',
+                              ],
+                              onNavigate: onNavigate,
+                            ),
+                            Icons.check_circle_outline,
+                          );
+                        },
+                      ),
+                      _ViewTile(
+                        icon: Icons.shopping_cart,
+                        title: 'Recent Orders',
+                        mockup: true,
+                        sub: '341 total, 18 this week',
+                        count: '341',
+                        onTap: () {
+                          onNavigate?.call(
+                            'Recent Orders',
+                            ListView2(
+                              mockup: true,
+                              title: 'Orders',
+                              columns: const [
+                                'Order #',
+                                'Customer',
+                                'Items',
+                                'Total',
+                                'Status',
+                              ],
+                              rows: List.generate(
+                                8,
+                                (i) => [
+                                  'ORD-${2041 + i}',
+                                  [
+                                    'Acme Corp',
+                                    'TechStart',
+                                    'DataFlow',
+                                    'CloudNine',
+                                    'NetWorks',
+                                    'ByteSize',
+                                    'MidTech',
+                                    'CoreData',
+                                  ][i],
+                                  '${(i % 4) + 1} items',
+                                  '\$${((i + 1) * 299).toStringAsFixed(2)}',
+                                  i < 2
+                                      ? 'shipped'
+                                      : (i < 5 ? 'processing' : 'pending'),
+                                ],
+                              ),
+                              onNavigate: onNavigate,
+                            ),
+                            Icons.shopping_cart,
+                          );
+                        },
+                      ),
+                      _ViewTile(
+                        icon: Icons.receipt_long,
+                        title: 'Invoices',
+                        mockup: true,
+                        sub: '5 unpaid, 2 overdue',
+                        count: '5',
+                        alert: true,
+                        onTap: () {
+                          onNavigate?.call(
+                            'Invoices',
+                            ListView2(
+                              mockup: true,
+                              title: 'Invoices',
+                              columns: const [
+                                'Invoice #',
+                                'Customer',
+                                'Amount',
+                                'Due',
+                                'Status',
+                              ],
+                              rows: [
+                                [
+                                  'INV-1043',
+                                  'Acme Corp',
+                                  '\$2,118.45',
+                                  '2026-05-08',
+                                  'draft',
+                                ],
+                                [
+                                  'INV-1042',
+                                  'TechStart',
+                                  '\$890.00',
+                                  '2026-04-15',
+                                  'overdue',
+                                ],
+                                [
+                                  'INV-1041',
+                                  'DataFlow',
+                                  '\$3,450.00',
+                                  '2026-04-10',
+                                  'overdue',
+                                ],
+                                [
+                                  'INV-1040',
+                                  'CloudNine',
+                                  '\$1,200.00',
+                                  '2026-04-20',
+                                  'sent',
+                                ],
+                                [
+                                  'INV-1039',
+                                  'NetWorks',
+                                  '\$675.00',
+                                  '2026-04-25',
+                                  'sent',
+                                ],
+                              ],
+                              onNavigate: onNavigate,
+                            ),
+                            Icons.receipt_long,
+                          );
+                        },
+                      ),
+                      _ViewTile(
+                        icon: Icons.inventory_2,
+                        title: 'Products',
+                        mockup: true,
+                        sub: '89 active products',
+                        count: '89',
+                        onTap: () {
+                          onNavigate?.call(
+                            'Products',
+                            ListView2(
+                              mockup: true,
+                              title: 'Products',
+                              columns: const [
+                                'Name',
+                                'SKU',
+                                'Price',
+                                'Stock',
+                                'Category',
+                              ],
+                              rows: List.generate(
+                                8,
+                                (i) => [
+                                  [
+                                    'Web Hosting',
+                                    'SSL Certificate',
+                                    'Support Hours',
+                                    'Domain Name',
+                                    'Email Plan',
+                                    'CDN Service',
+                                    'Backup Plan',
+                                    'API Access',
+                                  ][i],
+                                  'SKU-${1001 + i}',
+                                  '\$${[299, 79, 150, 15, 49, 89, 39, 199][i]}.00',
+                                  '${[999, 245, 500, 999, 350, 180, 420, 275][i]}',
+                                  [
+                                    'hosting',
+                                    'security',
+                                    'support',
+                                    'domains',
+                                    'email',
+                                    'performance',
+                                    'backup',
+                                    'api',
+                                  ][i],
+                                ],
+                              ),
+                              onNavigate: onNavigate,
+                            ),
+                            Icons.inventory_2,
+                          );
+                        },
+                      ),
+                      _ViewTile(
+                        icon: Icons.folder,
+                        title: 'Projects',
+                        unavailable: !ScrollAPI().hasPlatform,
+                        sub: ScrollAPI().hasPlatform
+                            ? '${d.projectCount} projects'
+                            : 'Needs a platform URL (AskRobots)',
+                        count: ScrollAPI().hasPlatform
+                            ? '${d.projectCount}'
+                            : '—',
+                        onTap: () {
+                          onNavigate?.call(
+                            'Projects',
+                            LiveListView(
+                              title: 'Projects',
+                              collection: 'projects',
+                              columns: const ['Name', 'Status', 'Created'],
+                              fields: const ['name', 'status', 'created_at'],
+                              onNavigate: onNavigate,
+                            ),
+                            Icons.folder,
+                          );
+                        },
+                      ),
+                      _ViewTile(
+                        icon: Icons.paid_outlined,
+                        title: 'AI Usage',
+                        sub: 'Tokens and cost by model and day',
+                        count: '—',
+                        onTap: () {
+                          onNavigate?.call(
+                            'AI Usage',
+                            const AIUsageView(),
+                            Icons.paid_outlined,
+                          );
+                        },
+                      ),
                     ],
                   ),
-                  onNavigate: onNavigate,
-                ),
-                Icons.inventory_2,
-              );
-            },
+                ],
+              ),
+            ),
           ),
-          _ViewTile(
-            icon: Icons.folder,
-            title: 'Projects',
-            sub: ScrollAPI().hasPlatform
-                ? '${d.projectCount} projects'
-                : 'Needs a platform URL (AskRobots)',
-            count: ScrollAPI().hasPlatform ? '${d.projectCount}' : '—',
-            onTap: () {
-              onNavigate?.call(
-                'Projects',
-                LiveListView(
-                  title: 'Projects',
-                  collection: 'projects',
-                  columns: const ['Name', 'Status', 'Created'],
-                  fields: const ['name', 'status', 'created_at'],
-                  onNavigate: onNavigate,
-                ),
-                Icons.folder,
-              );
-            },
-          ),
-          _ViewTile(
-            icon: Icons.paid_outlined,
-            title: 'AI Usage',
-            sub: 'Tokens and cost by model and day',
-            count: '—',
-            onTap: () {
-              onNavigate?.call(
-                'AI Usage',
-                const AIUsageView(),
-                Icons.paid_outlined,
-              );
-            },
-          ),
-
           const SizedBox(height: 36),
 
           // Reports
@@ -2882,6 +2952,20 @@ class _ActionCard extends StatelessWidget {
   }
 }
 
+/// Home tiles laid out as an icon grid or a list, per [TileModeScope].
+class _TileGroup extends StatelessWidget {
+  final List<Widget> children;
+  const _TileGroup({required this.children});
+
+  @override
+  Widget build(BuildContext context) => TileModeScope.of(context)
+      ? Wrap(spacing: 12, runSpacing: 16, children: children)
+      : Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: children,
+        );
+}
+
 class _ViewTile extends StatelessWidget {
   final IconData icon;
   final String title;
@@ -2890,6 +2974,9 @@ class _ViewTile extends StatelessWidget {
   final bool alert;
   final VoidCallback onTap;
   final bool mockup;
+
+  /// Real, but needs something this connection lacks (shown grey).
+  final bool unavailable;
   const _ViewTile({
     required this.icon,
     required this.title,
@@ -2898,10 +2985,28 @@ class _ViewTile extends StatelessWidget {
     this.alert = false,
     required this.onTap,
     this.mockup = false,
+    this.unavailable = false,
   });
 
   @override
-  Widget build(BuildContext context) => mockup
+  Widget build(BuildContext context) {
+    if (TileModeScope.of(context)) {
+      return IconTile(
+        icon: icon,
+        label: title,
+        sub: unavailable ? 'needs a platform' : sub,
+        tooltip: sub,
+        badge: count == '—' ? null : count,
+        badgeAlert: alert,
+        onTap: onTap,
+        mockup: mockup,
+        unavailable: unavailable,
+      );
+    }
+    return _listBuild(context);
+  }
+
+  Widget _listBuild(BuildContext context) => mockup
       ? Padding(
           // Room above for the tag that sits on the border.
           padding: const EdgeInsets.only(top: 10, bottom: 4),
@@ -21632,133 +21737,6 @@ class _ReportCard extends StatelessWidget {
           ],
         ),
       ),
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Mockup styling: "planned, not built yet". Deliberately NOT grey (grey means
-// unavailable/locked): a dashed pink "blueprint" outline + MOCKUP tag.
-// ---------------------------------------------------------------------------
-
-const kMockupColor = Color(0xFFF472B6);
-const _mockupTooltip =
-    'Mockup: a design placeholder with sample data. Not built yet and not '
-    'connected to the server.';
-
-class MockupTag extends StatelessWidget {
-  const MockupTag({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: _mockupTooltip,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-        decoration: BoxDecoration(
-          // Solid, so the dashed border it sits on doesn't show through.
-          color: const Color(0xFF2A1724),
-          borderRadius: BorderRadius.circular(4),
-          border: Border.all(color: kMockupColor.withValues(alpha: 0.6)),
-        ),
-        child: const Text(
-          'MOCKUP',
-          style: TextStyle(
-            fontSize: 9,
-            fontWeight: FontWeight.bold,
-            letterSpacing: 0.8,
-            color: kMockupColor,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// Dashed pink outline + MOCKUP tag around a card/tile that isn't built yet.
-class MockupOutline extends StatelessWidget {
-  final Widget child;
-  final double radius;
-  const MockupOutline({super.key, required this.child, this.radius = 10});
-
-  @override
-  Widget build(BuildContext context) {
-    return CustomPaint(
-      painter: _DashedRRectPainter(kMockupColor, radius),
-      child: Stack(
-        clipBehavior: Clip.none,
-        children: [
-          child,
-          // Sits on the dashed border, clear of the content.
-          const Positioned(top: -9, right: 12, child: MockupTag()),
-        ],
-      ),
-    );
-  }
-}
-
-class _DashedRRectPainter extends CustomPainter {
-  final Color color;
-  final double radius;
-  _DashedRRectPainter(this.color, this.radius);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = color.withValues(alpha: 0.75)
-      ..strokeWidth = 1.2
-      ..style = PaintingStyle.stroke;
-    final path = Path()
-      ..addRRect(
-        RRect.fromRectAndRadius(Offset.zero & size, Radius.circular(radius)),
-      );
-    for (final metric in path.computeMetrics()) {
-      for (var d = 0.0; d < metric.length; d += 9) {
-        canvas.drawPath(metric.extractPath(d, d + 5), paint);
-      }
-    }
-  }
-
-  @override
-  bool shouldRepaint(_DashedRRectPainter old) =>
-      old.color != color || old.radius != radius;
-}
-
-/// A whole screen that is a mockup: pink banner on top, the mockup below.
-class MockupFrame extends StatelessWidget {
-  final Widget child;
-  final String what;
-  const MockupFrame({super.key, required this.child, required this.what});
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          decoration: BoxDecoration(
-            color: kMockupColor.withValues(alpha: 0.10),
-            border: const Border(
-              bottom: BorderSide(color: kMockupColor, width: 1),
-            ),
-          ),
-          child: Row(
-            children: [
-              const MockupTag(),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  '$what — design placeholder with sample data. Not built yet; '
-                  'nothing here reads or writes the server.',
-                  style: const TextStyle(fontSize: 12, color: kMockupColor),
-                ),
-              ),
-            ],
-          ),
-        ),
-        Expanded(child: child),
-      ],
     );
   }
 }

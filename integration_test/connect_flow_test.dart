@@ -5,6 +5,7 @@
 // Run:  tool/ui_test.sh        (or: flutter test integration_test/connect_flow_test.dart -d macos)
 
 import 'package:dbbasic_scroll/main.dart';
+import 'package:dbbasic_scroll/mockup.dart';
 import 'package:dbbasic_scroll/server_profiles.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
