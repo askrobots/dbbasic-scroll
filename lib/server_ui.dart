@@ -5,7 +5,7 @@
 // See the server's docs/generative-ui.md and docs/schema-forms.md.
 //
 // Everything here reads through user-level routes, so an API key works as
-// well as a session (measured on 6707021): POST /objects/action_nav_entries,
+// well as a session (measured on 6707021): GET /objects/action_nav_entries,
 // GET /api/schema/{c}, GET /collections/{views,nav_entries,...}/records.
 
 import 'dart:convert';
@@ -118,10 +118,13 @@ Future<NavMenu?> fetchNavMenu() async {
   final api = ScrollAPI();
   final base = api.objectServerUrl;
   if (base == null) return null;
+  // GET, not POST: the object answers both the same, and reading the menu is
+  // a read. GET is what the server's own web nav fetches on every page, so
+  // Scroll's Home costs the server exactly what a browser page view does
+  // (one DEBUG line in the object's log; every object run writes one).
   final res = await api.rawRequest(
-    'POST',
+    'GET',
     '${base}objects/action_nav_entries?format=json',
-    data: const {},
   );
   final body = res['body'];
   if (res['status'] == 200 && body is Map && body['groups'] is List) {

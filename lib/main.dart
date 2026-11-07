@@ -1418,6 +1418,53 @@ class _AppBar extends StatelessWidget {
 /// hop between saved connections (e.g. production and the nc VM) without
 /// signing out. Credentials live in the saved profiles, so switching never
 /// asks for a token again.
+/// Status bar: which server this is, by its saved name ("desk", "production")
+/// so a tunnel URL like 127.0.0.1:18001 never has to be decoded.
+class _ConnectionLabel extends StatefulWidget {
+  final String url;
+  const _ConnectionLabel({super.key, required this.url});
+
+  @override
+  State<_ConnectionLabel> createState() => _ConnectionLabelState();
+}
+
+class _ConnectionLabelState extends State<_ConnectionLabel> {
+  String? _name;
+
+  @override
+  void initState() {
+    super.initState();
+    ServerProfileStore().list().then((profiles) {
+      for (final p in profiles) {
+        if (p.objectServerUrl == widget.url) {
+          if (mounted) setState(() => _name = p.name);
+          return;
+        }
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Text.rich(
+      TextSpan(
+        children: [
+          if (_name != null)
+            TextSpan(
+              text: '$_name  ',
+              style: const TextStyle(
+                color: Colors.white70,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          TextSpan(text: widget.url),
+        ],
+      ),
+      style: const TextStyle(fontSize: 11, color: Colors.white38),
+    );
+  }
+}
+
 class _ServerSwitcher extends StatefulWidget {
   const _ServerSwitcher();
 
@@ -1867,9 +1914,9 @@ class _StatusBar extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 12),
-              Text(
-                api.objectServerUrl ?? '',
-                style: TextStyle(fontSize: 11, color: Colors.white38),
+              _ConnectionLabel(
+                key: ValueKey(api.objectServerUrl),
+                url: api.objectServerUrl ?? '',
               ),
               if (api.hasPlatform) ...[
                 const SizedBox(width: 8),
